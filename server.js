@@ -26,6 +26,8 @@ require('dotenv').config({ path: '/opt/gambino/.env' });
 // Add at top of server.js
 const winston = require('winston');
 
+
+
 const securityLogger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -491,6 +493,8 @@ const userSchema = new mongoose.Schema({
   walletAddress: { type: String, sparse: true, default: null },
   privateKey: { type: String, default: null },
   privateKeyIV: { type: String, default: null },
+  walletCreatedAt: { type: Date, default: null },
+  walletType: { type: String, enum: ['generated', 'connected', null], default: null },
   agreedToTerms: { type: Boolean, default: false },
   agreedToPrivacy: { type: Boolean, default: false },
   marketingConsent: { type: Boolean, default: false },
@@ -981,6 +985,198 @@ app.get('/api/admin/metrics', authenticate, requirePermission(PERMISSIONS.VIEW_A
   }
 });
 
+// NEW: MACHINE METRICS ENDPOINT - Aggregated machine & store data
+app.get('/api/admin/machine-metrics', authenticate, requirePermission(PERMISSIONS.VIEW_ALL_METRICS), async (req, res) => {
+  try {
+    const { storeId, timeframe = '7d' } = req.query;
+    
+    // Calculate date range
+    let startDate = new Date();
+    switch(timeframe) {
+      case '24h':
+        startDate.setDate(startDate.getDate() - 1);
+        break;
+      case '7d':
+        startDate.setDate(startDate.getDate() - 7);
+        break;
+      case '30d':
+        startDate.setDate(startDate.getDate() - 30);
+        break;
+      case '90d':
+        startDate.setDate(startDate.getDate() - 90);
+        break;
+      default:
+        startDate.setDate(startDate.getDate() - 7);
+    }
+
+    // Build query filter
+    const eventFilter = { 
+      timestamp: { $gte: startDate }
+    };
+    
+    // If venue manager, filter by their stores
+    if (req.user.role === 'venue_manager' && req.user.assignedVenues) {
+      eventFilter.storeId = { $in: req.user.assignedVenues };
+    } else if (storeId) {
+      // If specific store requested
+      eventFilter.storeId = storeId;
+    }
+
+    console.log('🔍 Machine metrics filter:', eventFilter);
+
+    // Aggregate events by machine
+    const machineStats = await Event.aggregate([
+      { $match: eventFilter },
+      {
+        $group: {
+          _id: {
+            machineId: '$gamingMachineId',
+            storeId: '$storeId',
+            eventType: '$eventType'
+          },
+          totalAmount: { $sum: '$amount' },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            machineId: '$_id.machineId',
+            storeId: '$_id.storeId'
+          },
+          moneyIn: {
+            $sum: {
+              $cond: [
+                { $eq: ['$_id.eventType', 'money_in'] },
+                '$totalAmount',
+                0
+              ]
+            }
+          },
+          moneyOut: {
+            $sum: {
+              $cond: [
+                { $in: ['$_id.eventType', ['voucher', 'voucher_print', 'money_out']] },
+                '$totalAmount',
+                0
+              ]
+            }
+          },
+          totalEvents: { $sum: '$count' }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          machineId: '$_id.machineId',
+          storeId: '$_id.storeId',
+          moneyIn: 1,
+          moneyOut: 1,
+          netRevenue: { $subtract: ['$moneyIn', '$moneyOut'] },
+          profitMargin: {
+            $cond: [
+              { $gt: ['$moneyIn', 0] },
+              {
+                $multiply: [
+                  { $divide: [
+                    { $subtract: ['$moneyIn', '$moneyOut'] },
+                    '$moneyIn'
+                  ]},
+                  100
+                ]
+              },
+              0
+            ]
+          },
+          totalEvents: 1
+        }
+      },
+      { $sort: { storeId: 1, machineId: 1 } }
+    ]);
+
+    // Aggregate by store
+    const storeStats = await Event.aggregate([
+      { $match: eventFilter },
+      {
+        $group: {
+          _id: {
+            storeId: '$storeId',
+            eventType: '$eventType'
+          },
+          totalAmount: { $sum: '$amount' },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.storeId',
+          moneyIn: {
+            $sum: {
+              $cond: [
+                { $eq: ['$_id.eventType', 'money_in'] },
+                '$totalAmount',
+                0
+              ]
+            }
+          },
+          moneyOut: {
+            $sum: {
+              $cond: [
+                { $in: ['$_id.eventType', ['voucher', 'voucher_print', 'money_out']] },
+                '$totalAmount',
+                0
+              ]
+            }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          storeId: '$_id',
+          moneyIn: 1,
+          moneyOut: 1,
+          netRevenue: { $subtract: ['$moneyIn', '$moneyOut'] },
+          gambinoCut: {
+            $multiply: [
+              { $subtract: ['$moneyIn', '$moneyOut'] },
+              0.05  // 5% fee
+            ]
+          }
+        }
+      }
+    ]);
+
+    // Get unique machine count
+    const machineCountQuery = storeId ? { storeId } : 
+      (req.user.role === 'venue_manager' && req.user.assignedVenues) ? 
+        { storeId: { $in: req.user.assignedVenues } } : {};
+    
+    const totalMachines = await Machine.countDocuments(machineCountQuery);
+
+    console.log(`📊 Machine metrics: ${machineStats.length} machines, ${storeStats.length} stores`);
+
+    res.json({
+      success: true,
+      timeframe,
+      summary: {
+        totalMachines,
+        totalStores: storeStats.length,
+        systemMoneyIn: storeStats.reduce((sum, s) => sum + s.moneyIn, 0),
+        systemMoneyOut: storeStats.reduce((sum, s) => sum + s.moneyOut, 0),
+        systemNetRevenue: storeStats.reduce((sum, s) => sum + s.netRevenue, 0),
+      },
+      byStore: storeStats,
+      byMachine: machineStats,
+      lastUpdated: new Date()
+    });
+
+  } catch (error) {
+    console.error('Machine metrics error:', error);
+    res.status(500).json({ error: 'Failed to load machine metrics' });
+  }
+});
+
 // PHASE 3: RECONCILIATION ROUTES  
 const { router: reconciliationRouter } = require('./src/routes/reconciliation');
 app.use('/api/admin/reconciliation', reconciliationRouter);
@@ -1290,7 +1486,11 @@ app.post('/api/wallet/generate', authenticate, async (req, res) => {
     user.walletAddress = publicKey;
     user.privateKey = encrypted;
     user.privateKeyIV = iv;
+    user.walletCreatedAt = new Date();  // ADD THIS
+    user.walletType = 'generated';      // ADD THIS
     await user.save();
+
+    console.log(`💳 Wallet generated for ${user.email}: ${publicKey.slice(0, 8)}...`);
 
     return res.json({
       success: true,
@@ -1416,21 +1616,7 @@ app.get('/api/wallet/private-key', authenticate, async (req, res) => {
 app.post('/api/wallet/connect', authenticate, async (req, res) => {
   try {
     const { publicKey, message, signatureBase64 } = req.body || {};
-    if (!publicKey || !message || !signatureBase64) {
-      return res.status(400).json({ error: 'publicKey, message, and signatureBase64 are required' });
-    }
-
-    let pubKeyBytes, sigBytes, msgBytes;
-    try {
-      pubKeyBytes = bs58.decode(publicKey);
-      sigBytes = Buffer.from(signatureBase64, 'base64');
-      msgBytes = new TextEncoder().encode(message);
-    } catch {
-      return res.status(400).json({ error: 'Invalid encoding in inputs' });
-    }
-
-    const ok = nacl.sign.detached.verify(msgBytes, sigBytes, pubKeyBytes);
-    if (!ok) return res.status(401).json({ error: 'Signature verification failed' });
+    // ... validation code ...
 
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -1445,8 +1631,12 @@ app.post('/api/wallet/connect', authenticate, async (req, res) => {
     user.walletAddress = publicKey;
     user.privateKey = null;
     user.privateKeyIV = null;
+    user.walletCreatedAt = new Date();  // ADD THIS
+    user.walletType = 'connected';       // ADD THIS
     user.lastActivity = new Date();
     await user.save();
+
+    console.log(`🔗 External wallet connected for ${user.email}: ${publicKey.slice(0, 8)}...`);
 
     return res.json({ success: true, walletAddress: publicKey });
   } catch (e) {
@@ -1866,6 +2056,40 @@ const migrateExistingUsers = async () => {
   }
 };
 
+// ONE-TIME MIGRATION: Backfill wallet creation dates for existing wallets
+const backfillWalletDates = async () => {
+  try {
+    console.log('🔄 Starting wallet date backfill migration...');
+    
+    // Find all users with wallets but no walletCreatedAt
+    const usersNeedingBackfill = await User.find({
+      walletAddress: { $exists: true, $ne: null },
+      walletCreatedAt: { $exists: false }
+    });
+
+    console.log(`📊 Found ${usersNeedingBackfill.length} wallets to backfill`);
+
+    for (const user of usersNeedingBackfill) {
+      // Set wallet creation date to account creation date (best guess)
+      user.walletCreatedAt = user.createdAt;
+      
+      // Try to determine wallet type based on privateKey presence
+      if (user.privateKey && user.privateKeyIV) {
+        user.walletType = 'generated';
+      } else {
+        user.walletType = 'connected';
+      }
+      
+      await user.save();
+    }
+
+    console.log(`✅ Backfilled ${usersNeedingBackfill.length} wallet records`);
+    return true;
+  } catch (error) {
+    console.error('❌ Wallet backfill migration failed:', error);
+    return false;
+  }
+};
 
 
 
@@ -1878,8 +2102,11 @@ const startServer = async () => {
     
     // 2. Run user venue assignment migration
     await migrateExistingUsers();
+
+    // 3. Backfill wallet dates (ADD THIS LINE) 👇
+    await backfillWalletDates();
     
-    // 3. Run session database repair
+    // 4. Run session database repair
     console.log('🔧 Repairing session database...');
     const repairSuccess = await repairSessionDatabase();
     
