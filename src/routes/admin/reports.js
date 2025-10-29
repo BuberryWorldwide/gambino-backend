@@ -118,6 +118,8 @@ router.post('/:reportId/reconciliation', async (req, res, next) => {
   });
 });
 
+
+
 // GET /api/admin/reports/:storeId/reconciliation - Get reconciliation summary
 router.get('/:storeId/reconciliation', async (req, res, next) => {
   const middlewares = [
@@ -437,6 +439,315 @@ router.get('/:storeId/financial-summary', async (req, res, next) => {
       console.error('❌ Financial summary error:', error);
       res.status(500).json({ 
         error: 'Failed to calculate financial summary',
+        message: error.message 
+      });
+    }
+  };
+  
+  runMiddleware();
+});
+
+// ✅ NEW ENDPOINT: GET /api/admin/reports/:storeId/daily-latest/:date
+// Get latest cumulative values for each machine on a specific date with deltas
+router.get('/:storeId/daily-latest/:date', async (req, res, next) => {
+  const middlewares = [
+    ...createVenueMiddleware({ action: 'view_reports' })
+  ];
+  
+  let index = 0;
+  const runMiddleware = (err) => {
+    if (err) return next(err);
+    if (index >= middlewares.length) return handler(req, res, next);
+    const middleware = middlewares[index++];
+    middleware(req, res, runMiddleware);
+  };
+  
+  const handler = async (req, res) => {
+    try {
+      const { storeId, date } = req.params;
+      
+      const targetDate = new Date(date);
+      if (isNaN(targetDate.getTime())) {
+        return res.status(400).json({ 
+          error: 'Invalid date format',
+          message: 'Date must be in YYYY-MM-DD format'
+        });
+      }
+      
+      const startOfDay = new Date(targetDate);
+      startOfDay.setHours(0, 0, 0, 0);
+      
+      const endOfDay = new Date(targetDate);
+      endOfDay.setHours(23, 59, 59, 999);
+      
+      console.log(`📊 Getting latest daily values for ${storeId} on ${date}`);
+      
+      // Get ALL money_in events for the day, sorted by timestamp (oldest first)
+      const moneyInEvents = await Event.find({
+        storeId: storeId,
+        eventType: 'money_in',
+        timestamp: { $gte: startOfDay, $lte: endOfDay }
+      }).sort({ timestamp: 1 }).lean();
+      
+      // Get ALL money_out events for the day
+      const moneyOutEvents = await Event.find({
+        storeId: storeId,
+        eventType: { $in: ['money_out', 'voucher_print', 'voucher'] },
+        timestamp: { $gte: startOfDay, $lte: endOfDay }
+      }).sort({ timestamp: 1 }).lean();
+      
+      // Process events to get latest values and calculate deltas
+      const machineData = {};
+      
+      // Process money_in events
+      moneyInEvents.forEach(event => {
+        const machineId = event.gamingMachineId;
+        
+        if (!machineData[machineId]) {
+          machineData[machineId] = {
+            machineId,
+            moneyInHistory: [],
+            moneyOutHistory: []
+          };
+        }
+        
+        machineData[machineId].moneyInHistory.push({
+          amount: event.amount,
+          timestamp: event.timestamp
+        });
+      });
+      
+      // Process money_out events
+      moneyOutEvents.forEach(event => {
+        const machineId = event.gamingMachineId;
+        
+        if (!machineData[machineId]) {
+          machineData[machineId] = {
+            machineId,
+            moneyInHistory: [],
+            moneyOutHistory: []
+          };
+        }
+        
+        machineData[machineId].moneyOutHistory.push({
+          amount: event.amount,
+          timestamp: event.timestamp
+        });
+      });
+      
+      // Build response with latest values and deltas
+      const machines = Object.keys(machineData).map(machineId => {
+        const data = machineData[machineId];
+        
+        // Get latest money_in (last report of the day)
+        const moneyInHistory = data.moneyInHistory;
+        const latestMoneyIn = moneyInHistory.length > 0 
+          ? moneyInHistory[moneyInHistory.length - 1].amount 
+          : 0;
+        const previousMoneyIn = moneyInHistory.length > 1 
+          ? moneyInHistory[moneyInHistory.length - 2].amount 
+          : 0;
+        const moneyInDelta = latestMoneyIn - previousMoneyIn;
+        
+        // Get latest money_out
+        const moneyOutHistory = data.moneyOutHistory;
+        const latestMoneyOut = moneyOutHistory.length > 0 
+          ? moneyOutHistory[moneyOutHistory.length - 1].amount 
+          : 0;
+        const previousMoneyOut = moneyOutHistory.length > 1 
+          ? moneyOutHistory[moneyOutHistory.length - 2].amount 
+          : 0;
+        const moneyOutDelta = latestMoneyOut - previousMoneyOut;
+        
+        return {
+          machineId,
+          moneyIn: parseFloat(latestMoneyIn.toFixed(2)),
+          moneyOut: parseFloat(latestMoneyOut.toFixed(2)),
+          netRevenue: parseFloat((latestMoneyIn - latestMoneyOut).toFixed(2)),
+          reportCount: moneyInHistory.length,
+          lastReportTime: moneyInHistory.length > 0 
+            ? moneyInHistory[moneyInHistory.length - 1].timestamp 
+            : null,
+          // Delta information
+          changesSinceLastReport: {
+            moneyInDelta: parseFloat(moneyInDelta.toFixed(2)),
+            moneyOutDelta: parseFloat(moneyOutDelta.toFixed(2)),
+            netDelta: parseFloat((moneyInDelta - moneyOutDelta).toFixed(2)),
+            hasMultipleReports: moneyInHistory.length > 1
+          }
+        };
+      });
+      
+      // Calculate totals
+      const totalMoneyIn = machines.reduce((sum, m) => sum + m.moneyIn, 0);
+      const totalMoneyOut = machines.reduce((sum, m) => sum + m.moneyOut, 0);
+      const totalNetRevenue = totalMoneyIn - totalMoneyOut;
+      
+      // Calculate total deltas
+      const totalMoneyInDelta = machines.reduce((sum, m) => 
+        sum + m.changesSinceLastReport.moneyInDelta, 0
+      );
+      const totalMoneyOutDelta = machines.reduce((sum, m) => 
+        sum + m.changesSinceLastReport.moneyOutDelta, 0
+      );
+      
+      console.log(`   📊 Found ${machines.length} machines with data`);
+      console.log(`   💵 Total Money IN: $${totalMoneyIn.toFixed(2)}`);
+      console.log(`   🎫 Total Money OUT: $${totalMoneyOut.toFixed(2)}`);
+      console.log(`   💰 Net Revenue: $${totalNetRevenue.toFixed(2)}`);
+      
+      res.json({
+        success: true,
+        date: date,
+        storeId: storeId,
+        totalMoneyIn: parseFloat(totalMoneyIn.toFixed(2)),
+        totalMoneyOut: parseFloat(totalMoneyOut.toFixed(2)),
+        netRevenue: parseFloat(totalNetRevenue.toFixed(2)),
+        totalReports: moneyInEvents.length,
+        machines: machines.sort((a, b) => b.netRevenue - a.netRevenue), // Sort by net revenue
+        changesSinceLastReport: {
+          moneyInDelta: parseFloat(totalMoneyInDelta.toFixed(2)),
+          moneyOutDelta: parseFloat(totalMoneyOutDelta.toFixed(2)),
+          netDelta: parseFloat((totalMoneyInDelta - totalMoneyOutDelta).toFixed(2))
+        },
+        lastReportTime: machines.length > 0 
+          ? Math.max(...machines.map(m => new Date(m.lastReportTime).getTime()))
+          : null
+      });
+      
+    } catch (error) {
+      console.error('❌ Error getting latest daily values:', error);
+      res.status(500).json({ 
+        error: 'Failed to get latest daily values',
+        message: error.message 
+      });
+    }
+  };
+  
+  runMiddleware();
+});
+
+/**
+ * GET /api/admin/reports/:storeId/cumulative/:date
+ * Get TRUE 24-hour cumulative totals using real-time events
+ * This gives accurate totals regardless of when daily reports were printed
+ */
+router.get('/:storeId/cumulative/:date', async (req, res, next) => {
+  const middlewares = [
+    ...createVenueMiddleware({ action: 'view_reports' })
+  ];
+  
+  let index = 0;
+  const runMiddleware = (err) => {
+    if (err) return next(err);
+    if (index >= middlewares.length) return handler(req, res, next);
+    const middleware = middlewares[index++];
+    middleware(req, res, runMiddleware);
+  };
+  
+  const handler = async (req, res) => {
+    try {
+      const { storeId, date } = req.params;
+      
+      const targetDate = new Date(date);
+      if (isNaN(targetDate.getTime())) {
+        return res.status(400).json({ 
+          error: 'Invalid date format',
+          message: 'Date must be in YYYY-MM-DD format'
+        });
+      }
+      
+      const startOfDay = new Date(targetDate);
+      startOfDay.setHours(0, 0, 0, 0);
+      
+      const endOfDay = new Date(targetDate);
+      endOfDay.setHours(23, 59, 59, 999);
+      
+      console.log(`📊 Fetching cumulative totals for ${storeId} on ${date}`);
+      
+      const results = await Event.aggregate([
+        {
+          $match: {
+            storeId: storeId,
+            timestamp: { $gte: startOfDay, $lte: endOfDay },
+            eventType: { $in: ['money_in', 'money_out', 'voucher_print'] }
+          }
+        },
+        {
+          $group: {
+            _id: { machineId: '$gamingMachineId', eventType: '$eventType' },
+            totalAmount: { $sum: '$amount' },
+            count: { $sum: 1 },
+            lastTimestamp: { $max: '$timestamp' }
+          }
+        },
+        { $sort: { '_id.machineId': 1, '_id.eventType': 1 } }
+      ]);
+      
+      const machineData = {};
+      let totalMoneyIn = 0;
+      let totalMoneyOut = 0;
+      let totalVouchers = 0;
+      let voucherCount = 0;
+      
+      results.forEach(item => {
+        const machineId = item._id.machineId;
+        const eventType = item._id.eventType;
+        
+        if (!machineData[machineId]) {
+          machineData[machineId] = {
+            machineId: machineId,
+            moneyIn: 0,
+            moneyOut: 0,
+            vouchers: 0,
+            voucherCount: 0,
+            netRevenue: 0,
+            lastActivity: null
+          };
+        }
+        
+        if (eventType === 'money_in') {
+          machineData[machineId].moneyIn = item.totalAmount;
+          totalMoneyIn += item.totalAmount;
+        } else if (eventType === 'money_out') {
+          machineData[machineId].moneyOut = item.totalAmount;
+          totalMoneyOut += item.totalAmount;
+        } else if (eventType === 'voucher_print') {
+          machineData[machineId].vouchers = item.totalAmount;
+          machineData[machineId].voucherCount = item.count;
+          totalVouchers += item.totalAmount;
+          voucherCount += item.count;
+        }
+        
+        if (!machineData[machineId].lastActivity || item.lastTimestamp > machineData[machineId].lastActivity) {
+          machineData[machineId].lastActivity = item.lastTimestamp;
+        }
+      });
+      
+      Object.values(machineData).forEach(machine => {
+        machine.netRevenue = machine.moneyIn - machine.moneyOut;
+      });
+      
+      const machines = Object.values(machineData).sort((a, b) => b.netRevenue - a.netRevenue);
+      const netRevenue = totalMoneyIn - totalMoneyOut;
+      
+      res.json({
+        success: true,
+        date: date,
+        storeId: storeId,
+        dataSource: 'real_time_events',
+        totalMoneyIn: totalMoneyIn,
+        totalMoneyOut: totalMoneyOut,
+        netRevenue: netRevenue,
+        voucherCount: voucherCount,
+        voucherTotal: totalVouchers,
+        machines: machines
+      });
+      
+    } catch (error) {
+      console.error('❌ Error fetching cumulative totals:', error);
+      res.status(500).json({ 
+        error: 'Failed to fetch cumulative totals',
         message: error.message 
       });
     }

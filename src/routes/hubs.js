@@ -437,7 +437,6 @@ router.get('/stats/summary',
 );
 
 // GET /api/admin/hubs/:hubId/discovered-machines - Get machines discovered by this hub
-
 router.get('/:hubId/discovered-machines',
   authenticate,
   requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]),
@@ -446,68 +445,62 @@ router.get('/:hubId/discovered-machines',
       const { hubId } = req.params;
       const hub = await Hub.findOne({ hubId });
       if (!hub) return res.status(404).json({ error: 'Hub not found' });
-
+      
       if (['venue_manager', 'venue_staff'].includes(req.user.role)) {
         if (!req.user.assignedVenues.includes(hub.storeId)) {
           return res.status(403).json({ error: 'Access denied' });
         }
       }
-
+      
       const Event = require('../models/Event');
       const distinctMachineIds = await Event.distinct('gamingMachineId', { 
         hubMachineId: hubId,
         gamingMachineId: { $ne: hubId }
       });
-
+      
       const machines = await Promise.all(distinctMachineIds.map(async (machineId) => {
         const machineRecord = await Machine.findOne({ machineId }).lean();
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-
-        const events = await Event.find({
-          hubMachineId: hubId, 
-          gamingMachineId: machineId,
-          eventType: { $in: ['money_in', 'money_out'] },
-          timestamp: { $gte: today }
-        }).sort({ timestamp: 1 }).lean();
-
-
-
-const dailyTotals = {};
-events.forEach(event => {
-  const date = new Date(event.timestamp).toISOString().split('T')[0];
-  if (!dailyTotals[date]) dailyTotals[date] = { moneyIn: 0, moneyOut: 0 };
-  
-  // Use Math.max to keep only the highest (latest) value per day
-  if (event.eventType === 'money_in') {
-    dailyTotals[date].moneyIn = Math.max(dailyTotals[date].moneyIn, event.amount || 0);
-  } else if (event.eventType === 'money_out') {
-    dailyTotals[date].moneyOut = Math.max(dailyTotals[date].moneyOut, event.amount || 0);
-  }
-});
-
-// CORRECT - Sum all days
-let moneyIn = 0, moneyOut = 0;
-Object.values(dailyTotals).forEach(day => {
-  moneyIn += day.moneyIn;
-  moneyOut += day.moneyOut;
-});
-
-
+        
+        const totals = await Event.aggregate([
+          {
+            $match: {
+              hubMachineId: hubId,
+              gamingMachineId: machineId,
+              eventType: { $in: ['money_in', 'money_out'] }
+            }
+          },
+          {
+            $group: {
+              _id: '$eventType',
+              total: { $sum: '$amount' }
+            }
+          }
+        ]);
+        
+        let moneyIn = 0;
+        let moneyOut = 0;
+        
+        totals.forEach(t => {
+          if (t._id === 'money_in') moneyIn = t.total;
+          if (t._id === 'money_out') moneyOut = t.total;
+        });
+        
         return {
           _id: machineRecord?._id,
           machineId,
           name: machineRecord?.name || machineId,
           isRegistered: !!machineRecord,
           storeId: hub.storeId,
+          hubMachineId: hubId,
           totalMoneyIn: Math.round(moneyIn * 100) / 100,
           totalMoneyOut: Math.round(moneyOut * 100) / 100,
           totalRevenue: Math.round((moneyIn - moneyOut) * 100) / 100
         };
       }));
-
+      
       res.json({ success: true, hubId, machines });
     } catch (error) {
+      console.error('Error loading discovered machines:', error);
       res.status(500).json({ error: 'Failed to load machines' });
     }
   }

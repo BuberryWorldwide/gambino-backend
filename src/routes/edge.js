@@ -149,27 +149,35 @@ router.post('/events', authenticateMachine, async (req, res) => {
     if (idempotencyKey) {
       const fullIdempotencyKey = `${req.machine.storeId}_${idempotencyKey}`;
       
-      const existingEvent = await Event.findOne({
-        storeId: req.machine.storeId,
-        idempotencyKey: fullIdempotencyKey
-      });
-
-      if (existingEvent) {
-        console.log(`⚠️ Duplicate event detected (idempotency): ${fullIdempotencyKey}`);
-        
-        return res.json({
-          success: true,
-          duplicate: true,
-          eventReceived: eventType,
-          machineId: req.machine.machineId,
-          gamingMachineId: gamingMachineId,
-          finalMachineId: gamingMachineId,
-          machineName: machineName,
-          mappingStatus: mappingStatus,
-          userBound: false,
-          userId: null,
-          timestamp: existingEvent.createdAt.toISOString()
+      // ✅ CHANGED: Skip idempotency check for daily reports (they have timestamps now)
+      const isDailyReport = metadata?.isDailyReport || metadata?.source === 'daily_report';
+      
+      if (!isDailyReport) {
+        // Only check for duplicates on non-daily events
+        const existingEvent = await Event.findOne({
+          storeId: req.machine.storeId,
+          idempotencyKey: fullIdempotencyKey
         });
+      
+        if (existingEvent) {
+          console.log(`⚠️ Duplicate event detected (idempotency): ${fullIdempotencyKey}`);
+          
+          return res.json({
+            success: true,
+            duplicate: true,
+            eventReceived: eventType,
+            machineId: req.machine.machineId,
+            gamingMachineId: gamingMachineId,
+            finalMachineId: gamingMachineId,
+            machineName: machineName,
+            mappingStatus: mappingStatus,
+            userBound: false,
+            userId: null,
+            timestamp: existingEvent.createdAt.toISOString()
+          });
+        }
+      } else {
+        console.log(`📊 Daily report event - allowing duplicate storage: ${fullIdempotencyKey}`);
       }
     }
 
