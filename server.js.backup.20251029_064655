@@ -167,6 +167,8 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 const hubRoutes = require('./src/routes/hubs');
 app.use('/api/hubs', hubRoutes);
@@ -229,6 +231,7 @@ const loginLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => `${req.ip}:${(req.body?.email || '').toLowerCase()}`,
   skipSuccessfulRequests: true,
 });
 
@@ -238,6 +241,7 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 5,
   skipSuccessfulRequests: true,
+  keyGenerator: (req) => `${req.ip}:${(req.body?.email || '').toLowerCase()}`,
   message: 'Too many authentication attempts, please try again in 15 minutes',
 });
 
@@ -257,64 +261,11 @@ const walletLimiter = rateLimit({
   message: 'Too many wallet operations, please slow down',
 });
 
-// ============================================================
-// ADMIN RATE LIMITING - SECURITY FIX
-// ============================================================
-
-// Admin-specific rate limiting (general admin operations)
-const adminRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { 
-    error: 'Too many admin requests from this IP',
-    retryAfter: 900 
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-
-  handler: (req, res) => {
-    const cfIp = req.headers['cf-connecting-ip'];
-    const realIp = cfIp || req.ip;
-    console.warn(`⚠️  Admin rate limit exceeded - Real IP: ${realIp}`);
-    res.status(429).json({
-      error: 'Too many admin requests',
-      retryAfter: 900
-    });
-  }
-});
-
-// Strict rate limiting for sensitive operations (treasury, user deletion, etc.)
-const strictRateLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 20,
-  message: { 
-    error: 'Too many sensitive operation requests',
-    retryAfter: 3600 
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
- 
-  handler: (req, res) => {
-    const cfIp = req.headers['cf-connecting-ip'];
-    const realIp = cfIp || req.ip;
-    console.error(`🚨 STRICT rate limit exceeded - Real IP: ${realIp}`);
-    res.status(429).json({
-      error: 'Too many sensitive requests',
-      retryAfter: 3600
-    });
-  }
-});
-
-console.log('✅ Admin rate limiting configured');
-
 // Apply to specific routes
-// Apply admin rate limiters
-app.use('/api/admin', adminRateLimiter);
-app.use('/api/admin/treasury/mint', strictRateLimiter);
-app.use('/api/admin/treasury/burn', strictRateLimiter);
-app.use('/api/admin/treasury/transfer', strictRateLimiter);
-console.log('✅ Admin rate limiters applied to routes');
-
+app.use('/api/auth/login', authLimiter);
+app.use('/api/users/register', authLimiter);
+app.use('/api/wallet', authenticate, walletLimiter);
+app.use('/api/admin/users', authenticate, rateLimit({ windowMs: 60000, max: 30 }));
 
 // --- UTILITY FUNCTIONS ---
 const crypto = require('crypto');
@@ -1061,169 +1012,168 @@ app.get('/api/admin/machine-metrics', authenticate, requirePermission(PERMISSION
         startDate.setDate(startDate.getDate() - 7);
     }
 
-    // Build query filter for DailyReports
-    const reportFilter = {
-      printedAt: { $gte: startDate }
+    // Build query filter
+    const eventFilter = { 
+      timestamp: { $gte: startDate }
     };
-
+    
     // If venue manager, filter by their stores
     if (req.user.role === 'venue_manager' && req.user.assignedVenues) {
-      reportFilter.storeId = { $in: req.user.assignedVenues };
+      eventFilter.storeId = { $in: req.user.assignedVenues };
     } else if (storeId) {
-      reportFilter.storeId = storeId;
+      // If specific store requested
+      eventFilter.storeId = storeId;
     }
 
-    console.log('🔍 Machine metrics filter:', reportFilter);
+    console.log('🔍 Machine metrics filter:', eventFilter);
 
-    // Get all reports in timeframe
-    const allReports = await DailyReport.find(reportFilter).lean();
-
-    // Group by store + date, keep only LATEST report per day
-    const latestReportsByDate = {};
-    allReports.forEach(report => {
-      const dateKey = `${report.storeId}_${report.printedAt.toISOString().split('T')[0]}`;
-      if (!latestReportsByDate[dateKey] || 
-          new Date(report.printedAt) > new Date(latestReportsByDate[dateKey].printedAt)) {
-        latestReportsByDate[dateKey] = report;
-      }
-    });
-
-    const latestReports = Object.values(latestReportsByDate);
-
-    // Aggregate by machine from latest reports
-    const machineStats = {};
-    latestReports.forEach(report => {
-      if (report.machineData && Array.isArray(report.machineData)) {
-        report.machineData.forEach(machine => {
-          const key = `${report.storeId}_${machine.machineId}`;
-          if (!machineStats[key]) {
-            machineStats[key] = {
-              machineId: machine.machineId,
-              storeId: report.storeId,
-              moneyIn: 0,
-              moneyOut: 0,
-              totalEvents: 0
-            };
-          }
-          machineStats[key].moneyIn += machine.moneyIn || 0;
-          machineStats[key].moneyOut += machine.collect || 0;
-          machineStats[key].totalEvents += machine.transactionCount || 0;
-        });
-      }
-    });
-
-
-// Merge voucher data into machine stats
-// 1. Calculate machine stats (without vouchers yet)
-const machineStatsArray = Object.values(machineStats).map(m => ({
-  ...m,
-  netRevenue: m.moneyIn - m.moneyOut,
-  profitMargin: m.moneyIn > 0 ? ((m.moneyIn - m.moneyOut) / m.moneyIn) * 100 : 0
-}));
-
-// 2. Aggregate by store (money in only)
-const storeStats = {};
-latestReports.forEach(report => {
-  if (!storeStats[report.storeId]) {
-    storeStats[report.storeId] = {
-      storeId: report.storeId,
-      moneyIn: 0,
-      moneyOut: 0
-    };
-  }
-  storeStats[report.storeId].moneyIn += report.totalRevenue || 0;
-});
-
-// 3. Get vouchers for money out
-const voucherFilter = {
-  timestamp: { $gte: startDate },
-  eventType: 'voucher_print'
-};
-if (req.user.role === 'venue_manager' && req.user.assignedVenues) {
-  voucherFilter.storeId = { $in: req.user.assignedVenues };
-} else if (storeId) {
-  voucherFilter.storeId = storeId;
-}
-
-const voucherEvents = await Event.find(voucherFilter).lean();
-console.log(`💸 Found ${voucherEvents.length} voucher events, total: $${voucherEvents.reduce((sum, e) => sum + (e.amount || 0), 0)}`);
-
-// 4. Add vouchers to store stats
-voucherEvents.forEach(event => {
-  if (storeStats[event.storeId]) {
-    storeStats[event.storeId].moneyOut += event.amount || 0;
-  }
-});
-
-// 5. Calculate net revenue and Gambino cut
-const storeStatsArray = Object.values(storeStats).map(s => ({
-  ...s,
-  netRevenue: s.moneyIn - s.moneyOut,
-  gambinoCut: (s.moneyIn - s.moneyOut) * 0.05
-}));
-
-// 6. Get vouchers per machine
-const machineVouchers = await Event.aggregate([
-  {
-    $match: {
-      timestamp: { $gte: startDate },
-      eventType: 'voucher_print',
-      storeId: { $in: storeStatsArray.map(s => s.storeId) }
-    }
-  },
-  {
-    $group: {
-      _id: {
-        machineId: '$gamingMachineId',
-        storeId: '$storeId'
+    // Aggregate events by machine
+    const machineStats = await Event.aggregate([
+      { $match: eventFilter },
+      {
+        $group: {
+          _id: {
+            machineId: '$gamingMachineId',
+            storeId: '$storeId',
+            eventType: '$eventType'
+          },
+          totalAmount: { $sum: '$amount' },
+          count: { $sum: 1 }
+        }
       },
-      totalVouchers: { $sum: '$amount' },
-      voucherCount: { $sum: 1 }
-    }
-  }
-]);
+      {
+        $group: {
+          _id: {
+            machineId: '$_id.machineId',
+            storeId: '$_id.storeId'
+          },
+          moneyIn: {
+            $sum: {
+              $cond: [
+                { $eq: ['$_id.eventType', 'money_in'] },
+                '$totalAmount',
+                0
+              ]
+            }
+          },
+          moneyOut: {
+            $sum: {
+              $cond: [
+                { $in: ['$_id.eventType', ['voucher', 'voucher_print', 'money_out']] },
+                '$totalAmount',
+                0
+              ]
+            }
+          },
+          totalEvents: { $sum: '$count' }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          machineId: '$_id.machineId',
+          storeId: '$_id.storeId',
+          moneyIn: 1,
+          moneyOut: 1,
+          netRevenue: { $subtract: ['$moneyIn', '$moneyOut'] },
+          profitMargin: {
+            $cond: [
+              { $gt: ['$moneyIn', 0] },
+              {
+                $multiply: [
+                  { $divide: [
+                    { $subtract: ['$moneyIn', '$moneyOut'] },
+                    '$moneyIn'
+                  ]},
+                  100
+                ]
+              },
+              0
+            ]
+          },
+          totalEvents: 1
+        }
+      },
+      { $sort: { storeId: 1, machineId: 1 } }
+    ]);
 
-// 7. Merge voucher data into machine stats
-const machineStatsWithVouchers = machineStatsArray.map(machine => {
-  const vouchers = machineVouchers.find(v => 
-    v._id.machineId === machine.machineId && 
-    v._id.storeId === machine.storeId
-  );
-  
-  const moneyOut = vouchers?.totalVouchers || 0;
-  const netRevenue = machine.moneyIn - moneyOut;
-  
-  return {
-    ...machine,
-    moneyOut,
-    netRevenue,
-    profitMargin: machine.moneyIn > 0 ? ((netRevenue / machine.moneyIn) * 100) : 0,
-    voucherCount: vouchers?.voucherCount || 0
-  };
-});
+    // Aggregate by store
+    const storeStats = await Event.aggregate([
+      { $match: eventFilter },
+      {
+        $group: {
+          _id: {
+            storeId: '$storeId',
+            eventType: '$eventType'
+          },
+          totalAmount: { $sum: '$amount' },
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.storeId',
+          moneyIn: {
+            $sum: {
+              $cond: [
+                { $eq: ['$_id.eventType', 'money_in'] },
+                '$totalAmount',
+                0
+              ]
+            }
+          },
+          moneyOut: {
+            $sum: {
+              $cond: [
+                { $in: ['$_id.eventType', ['voucher', 'voucher_print', 'money_out']] },
+                '$totalAmount',
+                0
+              ]
+            }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          storeId: '$_id',
+          moneyIn: 1,
+          moneyOut: 1,
+          netRevenue: { $subtract: ['$moneyIn', '$moneyOut'] },
+          gambinoCut: {
+            $multiply: [
+              { $subtract: ['$moneyIn', '$moneyOut'] },
+              0.05  // 5% fee
+            ]
+          }
+        }
+      }
+    ]);
 
-// 8. Get machine count
-const machineCountQuery = storeId ? { storeId } :
-  (req.user.role === 'venue_manager' && req.user.assignedVenues) ?
-    { storeId: { $in: req.user.assignedVenues } } : {};
-const totalMachines = await Machine.countDocuments(machineCountQuery);
+    // Get unique machine count
+    const machineCountQuery = storeId ? { storeId } : 
+      (req.user.role === 'venue_manager' && req.user.assignedVenues) ? 
+        { storeId: { $in: req.user.assignedVenues } } : {};
+    
+    const totalMachines = await Machine.countDocuments(machineCountQuery);
 
-console.log(`📊 Machine metrics: ${machineStatsWithVouchers.length} machines, ${storeStatsArray.length} stores (from ${latestReports.length} latest reports)`);
+    console.log(`📊 Machine metrics: ${machineStats.length} machines, ${storeStats.length} stores`);
 
-res.json({
-  success: true,
-  timeframe,
-  summary: {
-    totalMachines,
-    totalStores: storeStatsArray.length,
-    systemMoneyIn: storeStatsArray.reduce((sum, s) => sum + s.moneyIn, 0),
-    systemMoneyOut: storeStatsArray.reduce((sum, s) => sum + s.moneyOut, 0),
-    systemNetRevenue: storeStatsArray.reduce((sum, s) => sum + s.netRevenue, 0),
-  },
-  byStore: storeStatsArray,
-  byMachine: machineStatsWithVouchers,  // ← Use this instead of machineStatsArray
-  lastUpdated: new Date()
-});
+    res.json({
+      success: true,
+      timeframe,
+      summary: {
+        totalMachines,
+        totalStores: storeStats.length,
+        systemMoneyIn: storeStats.reduce((sum, s) => sum + s.moneyIn, 0),
+        systemMoneyOut: storeStats.reduce((sum, s) => sum + s.moneyOut, 0),
+        systemNetRevenue: storeStats.reduce((sum, s) => sum + s.netRevenue, 0),
+      },
+      byStore: storeStats,
+      byMachine: machineStats,
+      lastUpdated: new Date()
+    });
+
   } catch (error) {
     console.error('Machine metrics error:', error);
     res.status(500).json({ error: 'Failed to load machine metrics' });

@@ -115,6 +115,7 @@ router.get('/:hubId',
 );
 
 // POST /api/admin/hubs/register - Register new hub
+// POST /api/admin/hubs/register - Register new hub with refresh token system
 router.post('/register',
   authenticate,
   requirePermission([PERMISSIONS.MANAGE_ALL_STORES]),
@@ -127,6 +128,7 @@ router.post('/register',
           error: 'hubId, name, and storeId are required' 
         });
       }
+      
       
       // Check if hub already exists
       const existing = await Hub.findOne({ hubId });
@@ -143,60 +145,185 @@ router.post('/register',
         return res.status(404).json({ error: 'Store not found' });
       }
       
-      // Generate machine token for Pi authentication
-      const machineToken = jwt.sign(
-        { 
-          hubId,
-          storeId,
-          type: 'hub',
-          iat: Math.floor(Date.now() / 1000)
-        },
-        process.env.MACHINE_JWT_SECRET || process.env.JWT_SECRET,
-        { expiresIn: '365d' }
-      );
-      
-      const tokenExpiresAt = new Date();
-      tokenExpiresAt.setDate(tokenExpiresAt.getDate() + 365);
-      
-      // Create hub
-      const hub = await Hub.create({
+      // Create hub with initial token version
+      const hub = new Hub({
         hubId,
         name,
         storeId,
-        machineToken,
-        tokenGeneratedAt: new Date(),
-        tokenExpiresAt,
         serialConfig: {
           port: serialPort || '/dev/ttyUSB0'
         },
+        tokenVersion: 1,
         createdBy: req.user.email
       });
       
-      console.log(`✅ Hub registered: ${hubId} → ${store.storeName}`);
+      // Generate access + refresh tokens using the Hub model method
+      const tokens = hub.generateTokens();
+      
+      // Save hub with tokens
+      await hub.save();
+      
+      console.log(`✅ Hub registered: ${hubId} → ${store.storeName} (refresh token system)`);
       
       res.status(201).json({
         success: true,
         message: `Hub ${hubId} registered to ${store.storeName}`,
-        hub,
-        machineToken,
+        hub: {
+          hubId: hub.hubId,
+          name: hub.name,
+          storeId: hub.storeId,
+          tokenVersion: hub.tokenVersion
+        },
+        tokens: {
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          accessTokenExpiresAt: tokens.expiresAt,
+          accessTokenExpiresIn: tokens.expiresIn,
+          refreshTokenExpiresAt: hub.refreshTokenExpiresAt
+        },
         setupInstructions: {
+          envConfig: {
+            MACHINE_ID: hubId,
+            STORE_ID: storeId,
+            API_ENDPOINT: process.env.API_ENDPOINT || 'https://api.gambino.gold',
+            ACCESS_TOKEN: tokens.accessToken,
+            REFRESH_TOKEN: tokens.refreshToken,
+            SERIAL_PORT: serialPort || '/dev/ttyUSB0',
+            LOG_LEVEL: 'info',
+            NODE_ENV: 'production'
+          },
           steps: [
-            'SSH into your Raspberry Pi',
-            'Navigate to /opt/gambino-pi or ~/gambino-pi-app',
-            'Create or update .env file with:',
-            `  MACHINE_ID=${hubId}`,
-            `  STORE_ID=${storeId}`,
-            '  MACHINE_TOKEN=<paste token above>',
-            'Restart the service: sudo systemctl restart gambino-pi'
-          ]
+            '1. SSH into your Raspberry Pi',
+            '2. Navigate to /opt/gambino-pi or ~/gambino-pi-app',
+            '3. Create or update .env file with the configuration below',
+            '4. Restart the service: sudo systemctl restart gambino-pi',
+            '5. The Pi will automatically refresh the access token before it expires'
+          ],
+          tokenInfo: {
+            accessToken: 'Valid for 7 days, auto-refreshed by Pi',
+            refreshToken: 'Valid for 1 year, used to get new access tokens',
+            autoRenewal: 'Pi will automatically refresh access token when it has < 24 hours remaining'
+          }
         }
       });
     } catch (error) {
       console.error('Register hub error:', error);
-      res.status(500).json({ error: 'Failed to register hub' });
+      res.status(500).json({ 
+        error: 'Failed to register hub',
+        details: error.message 
+      });
     }
   }
 );
+
+// POST /api/admin/hubs/:hubId/regenerate-token - UPDATED for refresh token system
+router.post('/:hubId/regenerate-token',
+  authenticate,
+  requirePermission([PERMISSIONS.MANAGE_ALL_STORES]),
+  async (req, res) => {
+    try {
+      const hub = await Hub.findOne({ hubId: req.params.hubId });
+      
+      if (!hub) {
+        return res.status(404).json({ error: 'Hub not found' });
+      }
+      
+      // Revoke old tokens (increment version)
+      hub.revokeTokens('admin_regeneration');
+      
+      // Generate new tokens
+      const tokens = hub.generateTokens();
+      
+      // Save with new tokens
+      hub.lastModifiedBy = req.user.email;
+      await hub.save();
+      
+      console.log(`✅ Tokens regenerated for hub: ${hub.hubId} (new version: ${hub.tokenVersion})`);
+      
+      res.json({
+        success: true,
+        message: 'Tokens regenerated successfully',
+        tokens: {
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          accessTokenExpiresAt: tokens.expiresAt,
+          accessTokenExpiresIn: tokens.expiresIn,
+          refreshTokenExpiresAt: hub.refreshTokenExpiresAt
+        },
+        tokenVersion: hub.tokenVersion,
+        instructions: [
+          'Update both ACCESS_TOKEN and REFRESH_TOKEN in Pi .env file',
+          'Restart the service: sudo systemctl restart gambino-pi',
+          'Old tokens are now invalid (token version incremented)'
+        ]
+      });
+    } catch (error) {
+      console.error('Regenerate token error:', error);
+      res.status(500).json({ 
+        error: 'Failed to regenerate tokens',
+        details: error.message 
+      });
+    }
+  }
+);
+
+// NEW: POST /api/edge/refresh-token - Pi endpoint to refresh access token
+router.post('/edge/refresh-token', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    
+    if (!refreshToken) {
+      return res.status(400).json({ 
+        error: 'Refresh token required' 
+      });
+    }
+    
+    // Find hub by refresh token
+    const hub = await Hub.findByRefreshToken(refreshToken);
+    
+    if (!hub) {
+      return res.status(401).json({ 
+        error: 'Invalid or expired refresh token',
+        action: 'Please regenerate tokens in admin dashboard'
+      });
+    }
+    
+    // Refresh the access token
+    const newToken = hub.refreshAccessToken();
+    
+    // Save updated hub
+    await hub.save();
+    
+    console.log(`🔄 Access token refreshed for hub: ${hub.hubId}`);
+    
+    res.json({
+      success: true,
+      accessToken: newToken.accessToken,
+      expiresAt: newToken.expiresAt,
+      expiresIn: newToken.expiresIn,
+      tokenVersion: hub.tokenVersion,
+      message: 'Access token refreshed successfully'
+    });
+    
+  } catch (error) {
+    console.error('Token refresh error:', error);
+    
+    if (error.message === 'Refresh token expired') {
+      return res.status(401).json({ 
+        error: 'Refresh token expired',
+        action: 'Please regenerate tokens in admin dashboard'
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Failed to refresh token',
+      details: error.message 
+    });
+  }
+});
+
+
+
 
 // PUT /api/admin/hubs/:hubId - Update hub
 router.put('/:hubId',
@@ -848,6 +975,28 @@ router.post('/:hubId/register-discovered',
       console.error('❌ Failed to register machines:', error);
       res.status(500).json({ 
         error: 'Failed to register machines',
+        details: error.message 
+      });
+    }
+  }
+);
+
+router.post('/admin/hubs/cleanup-tokens',
+  authenticate,
+  requirePermission([PERMISSIONS.MANAGE_ALL_STORES]),
+  async (req, res) => {
+    try {
+      const cleanedCount = await Hub.cleanupExpiredTokens();
+      
+      res.json({
+        success: true,
+        message: `Cleaned up ${cleanedCount} expired tokens`,
+        cleanedCount
+      });
+    } catch (error) {
+      console.error('Token cleanup error:', error);
+      res.status(500).json({ 
+        error: 'Failed to cleanup tokens',
         details: error.message 
       });
     }

@@ -205,6 +205,10 @@ router.get('/venues/:venueId/events',
 /**
  * GET /api/admin/events/today/summary
  * Get today's summary across all machines (for dashboard cards)
+ * 
+ * CRITICAL FIX: The issue is that money_in and money_out events from daily reports
+ * represent CUMULATIVE totals per machine per day, not incremental amounts.
+ * We need to take the MAX value per machine per day, not sum them.
  */
 router.get('/events/today/summary',
   authenticate,
@@ -213,10 +217,12 @@ router.get('/events/today/summary',
     try {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
 
       const events = await Event.find({
-        timestamp: { $gte: today }
-      });
+        timestamp: { $gte: today, $lt: tomorrow }
+      }).lean();
 
       const stats = {
         totalRevenue: 0,
@@ -226,53 +232,43 @@ router.get('/events/today/summary',
         activeMachines: new Set()
       };
 
-      // ✅ FIX #3: Group by machine and date for correct aggregation
-      const machineDaily = {};
+      const machineData = {};
 
       events.forEach(event => {
         const machineId = event.gamingMachineId || event.machineId;
+        if (!machineId) return;
+        
         stats.activeMachines.add(machineId);
         
-        const date = event.timestamp.toISOString().split('T')[0];
-        const key = `${machineId}_${date}`;
-        
-        if (!machineDaily[key]) {
-          machineDaily[key] = { moneyIn: 0, moneyOut: 0, vouchers: 0 };
+        if (!machineData[machineId]) {
+          machineData[machineId] = { moneyIn: 0, moneyOut: 0, vouchers: 0 };
         }
 
         if (event.eventType === 'money_in') {
-          // Keep highest cumulative value for this machine-day
-          machineDaily[key].moneyIn = Math.max(machineDaily[key].moneyIn, event.amount || 0);
-        } else if (event.eventType === 'money_out') {
-          // Keep highest cumulative value for this machine-day
-          machineDaily[key].moneyOut = Math.max(machineDaily[key].moneyOut, event.amount || 0);
-        } else if (event.eventType === 'voucher_print') {
-          // Vouchers are individual transactions - count and sum them
+          machineData[machineId].moneyIn = Math.max(machineData[machineId].moneyIn, event.amount || 0);
+        } 
+        else if (event.eventType === 'money_out') {
+          machineData[machineId].moneyOut = Math.max(machineData[machineId].moneyOut, event.amount || 0);
+        }
+        else if (event.eventType === 'voucher' || event.eventType === 'voucher_print') {
+          machineData[machineId].vouchers += event.amount || 0;
           stats.totalVouchers += 1;
-          machineDaily[key].vouchers += event.amount || 0;
         }
       });
 
-      // Sum all daily totals
-      Object.values(machineDaily).forEach(daily => {
-        stats.totalMoneyIn += daily.moneyIn;
-        stats.totalMoneyOut += daily.moneyOut + daily.vouchers;
+      Object.values(machineData).forEach(machine => {
+        stats.totalMoneyIn += machine.moneyIn;
+        stats.totalMoneyOut += machine.moneyOut + machine.vouchers;
       });
 
       stats.totalRevenue = stats.totalMoneyIn - stats.totalMoneyOut;
       stats.activeMachines = stats.activeMachines.size;
 
-      res.json({
-        success: true,
-        stats
-      });
 
+      res.json({ success: true, stats });
     } catch (error) {
       console.error('Error fetching today summary:', error);
-      res.status(500).json({
-        success: false,
-        error: 'Failed to fetch today summary'
-      });
+      res.status(500).json({ success: false, error: 'Failed to fetch today summary' });
     }
   }
 );
