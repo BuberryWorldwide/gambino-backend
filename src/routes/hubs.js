@@ -63,6 +63,64 @@ router.get('/',
   }
 );
 
+// GET /api/admin/machines/all - Get all machines from all hubs in one call
+router.get('/machines/all',
+  authenticate,
+  requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]),
+  async (req, res) => {
+    try {
+      const userRole = req.user.role;
+      const assignedVenues = req.user.assignedVenues || [];
+
+      // Get all hubs
+      let hubFilter = {};
+      if (['venue_manager', 'venue_staff'].includes(userRole) && assignedVenues.length > 0) {
+        hubFilter.storeId = { $in: assignedVenues };
+      }
+      
+      const hubs = await Hub.find(hubFilter).lean();
+      
+      const allMachines = [];
+      
+      // Get machines from each hub
+      for (const hub of hubs) {
+        try {
+          const distinctMachineIds = await Event.distinct('gamingMachineId', { 
+            hubMachineId: hub.hubId,
+            gamingMachineId: { $ne: hub.hubId }
+          });
+
+          for (const machineId of distinctMachineIds) {
+            const machineRecord = await Machine.findOne({ machineId }).lean();
+            
+            allMachines.push({
+              _id: machineRecord?._id,
+              machineId,
+              name: machineRecord?.name || machineId,
+              isRegistered: !!machineRecord,
+              hubId: hub.hubId,
+              storeId: hub.storeId,
+              store: hub.store
+            });
+          }
+        } catch (err) {
+          console.error(`Failed to load machines for hub ${hub.hubId}`);
+        }
+      }
+
+      res.json({ 
+        success: true, 
+        machines: allMachines,
+        count: allMachines.length
+      });
+
+    } catch (error) {
+      console.error('Get all machines error:', error);
+      res.status(500).json({ error: 'Failed to load machines' });
+    }
+  }
+);
+
 // GET /api/admin/hubs/:hubId - Get hub details
 router.get('/:hubId',
   authenticate,
@@ -579,6 +637,15 @@ router.get('/:hubId/discovered-machines',
         }
       }
       
+      // Date range filtering (default to last 7 days)
+      const endDate = req.query.endDate ? new Date(req.query.endDate) : new Date();
+      endDate.setHours(23, 59, 59, 999);
+      
+      const startDate = req.query.startDate 
+        ? new Date(req.query.startDate) 
+        : new Date(endDate.getTime() - (7 * 24 * 60 * 60 * 1000)); // 7 days ago
+      startDate.setHours(0, 0, 0, 0);
+      
       const Event = require('../models/Event');
       const distinctMachineIds = await Event.distinct('gamingMachineId', { 
         hubMachineId: hubId,
@@ -588,29 +655,48 @@ router.get('/:hubId/discovered-machines',
       const machines = await Promise.all(distinctMachineIds.map(async (machineId) => {
         const machineRecord = await Machine.findOne({ machineId }).lean();
         
-        const totals = await Event.aggregate([
-          {
-            $match: {
-              hubMachineId: hubId,
-              gamingMachineId: machineId,
-              eventType: { $in: ['money_in', 'money_out'] }
-            }
-          },
-          {
-            $group: {
-              _id: '$eventType',
-              total: { $sum: '$amount' }
-            }
-          }
-        ]);
+        // Get events within date range
+        const events = await Event.find({
+          hubMachineId: hubId,
+          gamingMachineId: machineId,
+          eventType: { $in: ['money_in', 'money_out', 'voucher_print'] },
+          timestamp: { $gte: startDate, $lte: endDate }
+        }).sort({ timestamp: 1 }).lean();
         
+        // Group by date and handle cumulative vs transaction events correctly
+        const dailyTotals = {};
+        let voucherTotal = 0;
+        
+        events.forEach(event => {
+          const date = new Date(event.timestamp).toISOString().split('T')[0];
+          
+          if (!dailyTotals[date]) {
+            dailyTotals[date] = { moneyIn: 0, moneyOut: 0 };
+          }
+          
+          // Cumulative events: Keep highest value per day (latest snapshot)
+          if (event.eventType === 'money_in') {
+            dailyTotals[date].moneyIn = Math.max(dailyTotals[date].moneyIn, event.amount || 0);
+          } else if (event.eventType === 'money_out') {
+            dailyTotals[date].moneyOut = Math.max(dailyTotals[date].moneyOut, event.amount || 0);
+          }
+          // Transaction events: Sum all occurrences
+          else if (event.eventType === 'voucher_print') {
+            voucherTotal += event.amount || 0;
+          }
+        });
+        
+        // Sum all daily totals
         let moneyIn = 0;
         let moneyOut = 0;
         
-        totals.forEach(t => {
-          if (t._id === 'money_in') moneyIn = t.total;
-          if (t._id === 'money_out') moneyOut = t.total;
+        Object.values(dailyTotals).forEach(day => {
+          moneyIn += day.moneyIn;
+          moneyOut += day.moneyOut;
         });
+        
+        // Add vouchers to money out (vouchers are payouts)
+        moneyOut += voucherTotal;
         
         return {
           _id: machineRecord?._id,
@@ -625,7 +711,15 @@ router.get('/:hubId/discovered-machines',
         };
       }));
       
-      res.json({ success: true, hubId, machines });
+      res.json({ 
+        success: true, 
+        hubId, 
+        machines,
+        dateRange: {
+          startDate: startDate.toISOString(),
+          endDate: endDate.toISOString()
+        }
+      });
     } catch (error) {
       console.error('Error loading discovered machines:', error);
       res.status(500).json({ error: 'Failed to load machines' });

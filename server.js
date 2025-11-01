@@ -1238,7 +1238,7 @@ app.use('/api/admin/reconciliation', reconciliationRouter);
 const { router: reportsRouter, setupMiddleware: setupReportsMiddleware, setupModels: setupReportsModels } = require('./src/routes/admin/reports');
 
 const eventsRouter = require('./src/routes/events');
-app.use('/api/admin', eventsRouter);
+app.use('/api/admin/events', eventsRouter);  
 
 // Setup middleware for reports routes
 setupReportsMiddleware(authenticate, requirePermission, createVenueMiddleware);
@@ -1270,6 +1270,7 @@ app.get('/api/users/profile', authenticate, async (req, res) => {
         gluckScore: user.gluckScore,
         tier: user.tier,
         role: user.role || 'user',
+        assignedVenues: user.assignedVenues || [],
         totalJackpots: user.totalJackpots,
         majorJackpots: user.majorJackpots,
         minorJackpots: user.minorJackpots,
