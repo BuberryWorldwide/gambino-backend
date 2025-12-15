@@ -7,10 +7,53 @@ const Machine = require('../models/Machine');
 const Store = require('../models/Store');
 const DailyReport = require('../models/DailyReport');
 const { authenticate, requirePermission, PERMISSIONS } = require('../middleware/rbac');
+const Event = require('../models/Event');
+const SSH_KEY_PATH = process.env.SSH_KEY_PATH || '';
+const SSH_USER = process.env.SSH_USER || 'gambino';
 
 // ============================================================================
 // ADMIN ENDPOINTS - Hub Management
 // ============================================================================
+
+// GET /api/token/status - Token status check endpoint for Pis
+router.get('/token/status', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    
+    // Decode without verifying (to get expiration even if expired)
+    const decoded = jwt.decode(token);
+    
+    if (!decoded || !decoded.exp) {
+      return res.status(401).json({ error: 'Invalid token format' });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const expiresIn = decoded.exp - now; // seconds until expiration
+    
+    // Refresh if less than 24 hours remaining (86400 seconds)
+    const needsRefresh = expiresIn < 86400;
+
+    res.json({
+      success: true,
+      needsRefresh,
+      expiresIn,
+      expiresAt: new Date(decoded.exp * 1000).toISOString(),
+      tokenVersion: decoded.tokenVersion || 1
+    });
+    
+  } catch (error) {
+    console.error('Token status check error:', error);
+    res.status(500).json({ 
+      error: 'Failed to check token status',
+      details: error.message 
+    });
+  }
+});
 
 // GET /api/admin/hubs - List all hubs (filtered by role)
 router.get('/', 
@@ -85,8 +128,9 @@ router.get('/machines/all',
       // Get machines from each hub
       for (const hub of hubs) {
         try {
-          const distinctMachineIds = await Event.distinct('gamingMachineId', { 
+          const distinctMachineIds = await Event.distinct('gamingMachineId', {
             hubMachineId: hub.hubId,
+            storeId: hub.storeId,
             gamingMachineId: { $ne: hub.hubId }
           });
 
@@ -149,10 +193,62 @@ router.get('/:hubId',
         .select('storeId storeName address city state')
         .lean();
       
-      // Get machines on this hub
-      const machines = await Machine.find({ hubId: hub.hubId })
-        .select('machineId name status gameType lastSeen')
-        .lean();
+      // Get machines that have actually sent events from THIS hub at THIS store
+      const machineIds = await Event.distinct('gamingMachineId', {
+        hubMachineId: hub.hubId,
+        storeId: hub.storeId
+      });
+
+      // Get machine details with revenue stats
+      const machineStats = await Event.aggregate([
+        {
+          $match: {
+            hubMachineId: hub.hubId,
+            storeId: hub.storeId,
+            gamingMachineId: { $in: machineIds }
+          }
+        },
+        {
+          $group: {
+            _id: '$gamingMachineId',
+            moneyIn: { 
+              $sum: { $cond: [{ $eq: ['$eventType', 'money_in'] }, '$amount', 0] }
+            },
+            moneyOut: { 
+              $sum: { $cond: [{ $eq: ['$eventType', 'money_out'] }, '$amount', 0] }
+            }
+          }
+        }
+      ]);
+
+      // Get registered machine details
+      const registeredMachines = await Machine.find({
+        machineId: { $in: machineIds },
+        storeId: hub.storeId
+      }).select('machineId name status gameType lastSeen').lean();
+
+      // Merge stats with machine details
+      const machineMap = new Map(registeredMachines.map(m => [m.machineId, m]));
+      const statsMap = new Map(machineStats.map(s => [s._id, s]));
+
+      const machines = machineIds.map(id => {
+        const machine = machineMap.get(id) || {
+          machineId: id,
+          name: `Unmapped ${id}`,
+          status: 'active',
+          mappingStatus: 'unmapped'
+        };
+        const stats = statsMap.get(id) || { moneyIn: 0, moneyOut: 0 };
+        
+        return {
+          ...machine,
+          revenue: {
+            moneyIn: stats.moneyIn,
+            moneyOut: stats.moneyOut,
+            net: stats.moneyIn - stats.moneyOut
+          }
+        };
+      }).sort((a, b) => a.machineId.localeCompare(b.machineId));
       
       res.json({
         success: true,
@@ -172,7 +268,6 @@ router.get('/:hubId',
   }
 );
 
-// POST /api/admin/hubs/register - Register new hub
 // POST /api/admin/hubs/register - Register new hub with refresh token system
 router.post('/register',
   authenticate,
@@ -186,7 +281,6 @@ router.post('/register',
           error: 'hubId, name, and storeId are required' 
         });
       }
-      
       
       // Check if hub already exists
       const existing = await Hub.findOne({ hubId });
@@ -216,7 +310,7 @@ router.post('/register',
       });
       
       // Generate access + refresh tokens using the Hub model method
-      const tokens = hub.generateTokens();
+      hub.generateTokens();
       
       // Save hub with tokens
       await hub.save();
@@ -233,10 +327,10 @@ router.post('/register',
           tokenVersion: hub.tokenVersion
         },
         tokens: {
-          accessToken: tokens.accessToken,
-          refreshToken: tokens.refreshToken,
-          accessTokenExpiresAt: tokens.expiresAt,
-          accessTokenExpiresIn: tokens.expiresIn,
+          accessToken: hub.accessToken,
+          refreshToken: hub.refreshToken,
+          accessTokenExpiresAt: hub.accessTokenExpiresAt,
+          accessTokenExpiresIn: '7d',
           refreshTokenExpiresAt: hub.refreshTokenExpiresAt
         },
         setupInstructions: {
@@ -244,8 +338,8 @@ router.post('/register',
             MACHINE_ID: hubId,
             STORE_ID: storeId,
             API_ENDPOINT: process.env.API_ENDPOINT || 'https://api.gambino.gold',
-            ACCESS_TOKEN: tokens.accessToken,
-            REFRESH_TOKEN: tokens.refreshToken,
+            MACHINE_TOKEN: hub.accessToken,
+            REFRESH_TOKEN: hub.refreshToken,
             SERIAL_PORT: serialPort || '/dev/ttyUSB0',
             LOG_LEVEL: 'info',
             NODE_ENV: 'production'
@@ -253,7 +347,7 @@ router.post('/register',
           steps: [
             '1. SSH into your Raspberry Pi',
             '2. Navigate to /opt/gambino-pi or ~/gambino-pi-app',
-            '3. Create or update .env file with the configuration below',
+            '3. Create or update .env file with the configuration above',
             '4. Restart the service: sudo systemctl restart gambino-pi',
             '5. The Pi will automatically refresh the access token before it expires'
           ],
@@ -274,58 +368,11 @@ router.post('/register',
   }
 );
 
-// POST /api/admin/hubs/:hubId/regenerate-token - UPDATED for refresh token system
-router.post('/:hubId/regenerate-token',
-  authenticate,
-  requirePermission([PERMISSIONS.MANAGE_ALL_STORES]),
-  async (req, res) => {
-    try {
-      const hub = await Hub.findOne({ hubId: req.params.hubId });
-      
-      if (!hub) {
-        return res.status(404).json({ error: 'Hub not found' });
-      }
-      
-      // Revoke old tokens (increment version)
-      hub.revokeTokens('admin_regeneration');
-      
-      // Generate new tokens
-      const tokens = hub.generateTokens();
-      
-      // Save with new tokens
-      hub.lastModifiedBy = req.user.email;
-      await hub.save();
-      
-      console.log(`✅ Tokens regenerated for hub: ${hub.hubId} (new version: ${hub.tokenVersion})`);
-      
-      res.json({
-        success: true,
-        message: 'Tokens regenerated successfully',
-        tokens: {
-          accessToken: tokens.accessToken,
-          refreshToken: tokens.refreshToken,
-          accessTokenExpiresAt: tokens.expiresAt,
-          accessTokenExpiresIn: tokens.expiresIn,
-          refreshTokenExpiresAt: hub.refreshTokenExpiresAt
-        },
-        tokenVersion: hub.tokenVersion,
-        instructions: [
-          'Update both ACCESS_TOKEN and REFRESH_TOKEN in Pi .env file',
-          'Restart the service: sudo systemctl restart gambino-pi',
-          'Old tokens are now invalid (token version incremented)'
-        ]
-      });
-    } catch (error) {
-      console.error('Regenerate token error:', error);
-      res.status(500).json({ 
-        error: 'Failed to regenerate tokens',
-        details: error.message 
-      });
-    }
-  }
-);
+// ============================================================================
+// EDGE/PI ENDPOINTS - Token Management
+// ============================================================================
 
-// NEW: POST /api/edge/refresh-token - Pi endpoint to refresh access token
+// POST /api/edge/refresh-token - Pi endpoint to refresh access token
 router.post('/edge/refresh-token', async (req, res) => {
   try {
     const { refreshToken } = req.body;
@@ -346,8 +393,8 @@ router.post('/edge/refresh-token', async (req, res) => {
       });
     }
     
-    // Refresh the access token
-    const newToken = hub.refreshAccessToken();
+    // Refresh the access token (this mutates the hub object)
+    hub.refreshAccessToken();
     
     // Save updated hub
     await hub.save();
@@ -356,9 +403,9 @@ router.post('/edge/refresh-token', async (req, res) => {
     
     res.json({
       success: true,
-      accessToken: newToken.accessToken,
-      expiresAt: newToken.expiresAt,
-      expiresIn: newToken.expiresIn,
+      accessToken: hub.accessToken,
+      expiresAt: hub.accessTokenExpiresAt.toISOString(),
+      expiresIn: '7d',
       tokenVersion: hub.tokenVersion,
       message: 'Access token refreshed successfully'
     });
@@ -380,8 +427,26 @@ router.post('/edge/refresh-token', async (req, res) => {
   }
 });
 
+// POST /api/token/refresh - Backward compatibility alias
+router.post('/token/refresh', async (req, res) => {
+  // Redirect to the main refresh endpoint
+  return router.handle(req, res, () => {
+    req.url = '/edge/refresh-token';
+    router(req, res);
+  });
+});
 
 
+
+// GET /api/edge/token-status - Alias for future Pi versions
+router.get('/edge/token-status', async (req, res) => {
+  req.url = '/token/status';
+  return router.handle(req, res);
+});
+
+// ============================================================================
+// ADMIN ENDPOINTS - Hub Operations
+// ============================================================================
 
 // PUT /api/admin/hubs/:hubId - Update hub
 router.put('/:hubId',
@@ -474,7 +539,7 @@ router.delete('/:hubId',
   }
 );
 
-// POST /api/admin/hubs/:hubId/regenerate-token - Regenerate auth token
+// POST /api/admin/hubs/:hubId/regenerate-token - Regenerate auth token (NEW DUAL-TOKEN FORMAT)
 router.post('/:hubId/regenerate-token',
   authenticate,
   requirePermission([PERMISSIONS.MANAGE_ALL_STORES]),
@@ -486,35 +551,33 @@ router.post('/:hubId/regenerate-token',
         return res.status(404).json({ error: 'Hub not found' });
       }
       
-      // Generate new token
-      const machineToken = jwt.sign(
-        { 
-          hubId: hub.hubId,
-          storeId: hub.storeId,
-          type: 'hub',
-          iat: Math.floor(Date.now() / 1000)
-        },
-        process.env.MACHINE_JWT_SECRET || process.env.JWT_SECRET,
-        { expiresIn: '365d' }
-      );
+      // Increment token version to invalidate old tokens
+      hub.tokenVersion += 1;
       
-      const tokenExpiresAt = new Date();
-      tokenExpiresAt.setDate(tokenExpiresAt.getDate() + 365);
+      // Generate new dual tokens
+      hub.generateTokens();
       
-      hub.machineToken = machineToken;
-      hub.tokenGeneratedAt = new Date();
-      hub.tokenExpiresAt = tokenExpiresAt;
       hub.lastModifiedBy = req.user.email;
       await hub.save();
       
-      console.log(`✅ Token regenerated for hub: ${hub.hubId}`);
+      console.log(`✅ Tokens regenerated for hub: ${hub.hubId} (version ${hub.tokenVersion})`);
       
       res.json({
         success: true,
-        message: 'Token regenerated successfully',
-        machineToken,
-        expiresAt: tokenExpiresAt,
-        instructions: 'Update MACHINE_TOKEN in Pi .env file and restart service'
+        message: 'Tokens regenerated successfully',
+        tokens: {
+          accessToken: hub.accessToken,
+          refreshToken: hub.refreshToken,
+          accessTokenExpiresAt: hub.accessTokenExpiresAt,
+          accessTokenExpiresIn: '7d',
+          refreshTokenExpiresAt: hub.refreshTokenExpiresAt,
+          tokenVersion: hub.tokenVersion
+        },
+        instructions: 'Update both MACHINE_TOKEN and REFRESH_TOKEN in Pi .env file and restart service',
+        envConfig: {
+          MACHINE_TOKEN: hub.accessToken,
+          REFRESH_TOKEN: hub.refreshToken
+        }
       });
     } catch (error) {
       console.error('Regenerate token error:', error);
@@ -523,8 +586,6 @@ router.post('/:hubId/regenerate-token',
   }
 );
 
-
-
 // GET /api/admin/hubs/:hubId/machines - Get machines on this hub
 router.get('/:hubId/machines',
   authenticate,
@@ -532,7 +593,6 @@ router.get('/:hubId/machines',
   async (req, res) => {
     try {
       const hub = await Hub.findOne({ hubId: req.params.hubId });
-      
       if (!hub) {
         return res.status(404).json({ error: 'Hub not found' });
       }
@@ -541,16 +601,43 @@ router.get('/:hubId/machines',
       const userRole = req.user.role;
       if (['venue_manager', 'venue_staff'].includes(userRole)) {
         if (!req.user.assignedVenues.includes(hub.storeId)) {
-          return res.status(403).json({ 
+          return res.status(403).json({
             error: 'Access denied to this hub',
-            storeId: hub.storeId 
+            storeId: hub.storeId
           });
         }
       }
       
-      const machines = await Machine.find({ hubId: hub.hubId })
-        .sort({ machineId: 1 })
-        .lean();
+      // Get unique machines that have actually sent events from THIS hub at THIS store
+      const machineIds = await Event.distinct('gamingMachineId', {
+        hubMachineId: hub.hubId,
+        storeId: hub.storeId
+      });
+      
+      // Get machine details (with fallback for unregistered machines)
+      const registeredMachines = await Machine.find({
+        machineId: { $in: machineIds },
+        storeId: hub.storeId
+      }).sort({ machineId: 1 }).lean();
+      
+      // Create map of registered machines
+      const machineMap = new Map(registeredMachines.map(m => [m.machineId, m]));
+      
+      // Build final list with unregistered machines as fallback
+      const machines = machineIds.map(id => {
+        if (machineMap.has(id)) {
+          return machineMap.get(id);
+        }
+        // Unregistered machine - create minimal object
+        return {
+          machineId: id,
+          name: `Unmapped ${id}`,
+          storeId: hub.storeId,
+          hubId: hub.hubId,
+          status: 'active',
+          mappingStatus: 'unmapped'
+        };
+      }).sort((a, b) => a.machineId.localeCompare(b.machineId));
       
       res.json({
         success: true,
@@ -646,18 +733,22 @@ router.get('/:hubId/discovered-machines',
         : new Date(endDate.getTime() - (7 * 24 * 60 * 60 * 1000)); // 7 days ago
       startDate.setHours(0, 0, 0, 0);
       
-      const Event = require('../models/Event');
       const distinctMachineIds = await Event.distinct('gamingMachineId', { 
         hubMachineId: hubId,
+        storeId: hub.storeId,
         gamingMachineId: { $ne: hubId }
       });
       
       const machines = await Promise.all(distinctMachineIds.map(async (machineId) => {
-        const machineRecord = await Machine.findOne({ machineId }).lean();
+        const machineRecord = await Machine.findOne({ 
+          machineId,
+          storeId: hub.storeId 
+        }).lean();
         
         // Get events within date range
         const events = await Event.find({
           hubMachineId: hubId,
+          storeId: hub.storeId,
           gamingMachineId: machineId,
           eventType: { $in: ['money_in', 'money_out', 'voucher_print'] },
           timestamp: { $gte: startDate, $lte: endDate }
@@ -727,9 +818,7 @@ router.get('/:hubId/discovered-machines',
   }
 );
 
-
 // GET /api/admin/hubs/:hubId/events - Get recent events from this hub
-
 router.get('/:hubId/events',
   authenticate,
   requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]),
@@ -752,8 +841,6 @@ router.get('/:hubId/events',
         }
       }
 
-      const Event = require('../models/Event');
-      
       // CRITICAL FIX: Use hubMachineId (not hubId)
       const events = await Event.find({ hubMachineId: hubId })
         .sort({ timestamp: -1 })
@@ -910,7 +997,7 @@ router.get('/:hubId/logs',
   }
 );
 
-
+// POST /api/admin/hubs/:hubId/register-machine - Register a single machine
 router.post('/:hubId/register-machine',
   authenticate,
   requirePermission([PERMISSIONS.MANAGE_ALL_STORES, PERMISSIONS.MANAGE_ASSIGNED_STORES]),
@@ -951,7 +1038,6 @@ router.post('/:hubId/register-machine',
   }
 );
 
-
 // BONUS: POST endpoint for Pi to send logs (for future Pi software update)
 router.post('/:hubId/logs',
   authenticate,
@@ -981,6 +1067,91 @@ router.post('/:hubId/logs',
         error: 'Failed to process logs',
         details: error.message 
       });
+    }
+  }
+);
+
+// POST /api/admin/hubs/:hubId/restart - Restart gambino-pi service
+router.post('/:hubId/restart',
+  authenticate,
+  requirePermission([PERMISSIONS.MANAGE_ALL_STORES, PERMISSIONS.MANAGE_ASSIGNED_STORES]),
+  async (req, res) => {
+    try {
+      const hub = await Hub.findOne({ hubId: req.params.hubId });
+      
+      if (!hub) {
+        return res.status(404).json({ error: 'Hub not found' });
+      }
+
+      // Venue access check
+      if (['venue_manager', 'venue_staff'].includes(req.user.role)) {
+        if (!req.user.assignedVenues.includes(hub.storeId)) {
+          return res.status(403).json({ error: 'Access denied to this hub' });
+        }
+      }
+
+      // Check if hub is online
+      const isOnline = hub.lastHeartbeat && 
+        (new Date().getTime() - new Date(hub.lastHeartbeat).getTime()) < 120000;
+      
+      if (!isOnline) {
+        return res.status(400).json({ 
+          error: 'Hub is offline. Cannot restart service.',
+          lastHeartbeat: hub.lastHeartbeat 
+        });
+      }
+
+      // Update hub status to restarting
+      hub.status = 'restarting';
+      hub.lastModifiedBy = req.user.email;
+      await hub.save();
+
+      // Execute service restart via SSH
+      const { exec } = require('child_process');
+      
+      // Use Tailscale IP or hostname - adjust this based on your network setup
+      const hubHost = hub.hubId; // or use a tailscale IP mapping if available
+      
+      const sshKeyOption = SSH_KEY_PATH ? `-i ${SSH_KEY_PATH}` : '';
+      const command = `ssh ${sshKeyOption} -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${SSH_USER}@${hubHost} "sudo systemctl restart gambino-pi"`;
+      
+      console.log(`🔄 Initiating gambino-pi service restart: ${hub.hubId} by ${req.user.email}`);
+      console.log(`   Command: ${command}`);
+      
+      exec(command, { timeout: 10000 }, async (error, stdout, stderr) => {
+        if (error) {
+          console.error(`❌ Service restart failed for ${hub.hubId}:`, error.message);
+          hub.status = 'error';
+          await hub.save();
+          return;
+        }
+        
+        console.log(`✅ gambino-pi service restart command sent: ${hub.hubId}`);
+        if (stdout) console.log(`   stdout: ${stdout}`);
+        if (stderr) console.log(`   stderr: ${stderr}`);
+        
+        // Reset status after 30 seconds
+        setTimeout(async () => {
+          const updatedHub = await Hub.findOne({ hubId: hub.hubId });
+          if (updatedHub && updatedHub.status === 'restarting') {
+            updatedHub.status = 'online';
+            await updatedHub.save();
+            console.log(`✅ Reset status for ${hub.hubId} to online`);
+          }
+        }, 30000);
+      });
+
+      res.json({
+        success: true,
+        message: `Service restart initiated for ${hub.name || hub.hubId}. Service will be back online in ~30 seconds.`,
+        timestamp: new Date().toISOString(),
+      });
+      
+      console.log(`📝 Logged restart action: ${hub.hubId} by ${req.user.email} at ${new Date().toISOString()}`);
+      
+    } catch (error) {
+      console.error('Restart service error:', error);
+      res.status(500).json({ error: 'Failed to restart service' });
     }
   }
 );
@@ -1075,6 +1246,7 @@ router.post('/:hubId/register-discovered',
   }
 );
 
+// POST /api/admin/hubs/cleanup-tokens - Cleanup expired tokens
 router.post('/admin/hubs/cleanup-tokens',
   authenticate,
   requirePermission([PERMISSIONS.MANAGE_ALL_STORES]),

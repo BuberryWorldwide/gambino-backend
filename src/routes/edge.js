@@ -223,8 +223,7 @@ router.post('/events', authenticateMachine, async (req, res) => {
 
     // Process daily summary into DailyReport (in background)
     // Process daily summary into DailyReport (in background)
-if (eventRecord.eventType === 'money_in' && eventRecord.metadata?.source === 'daily_report') {
-  const DailyReportProcessor = require('../services/DailyReportProcessor');
+if ((eventRecord.eventType === 'money_in' && eventRecord.metadata?.source === 'daily_report') || eventRecord.eventType === 'daily_summary') {  const DailyReportProcessor = require('../services/DailyReportProcessor');
   const processor = new DailyReportProcessor();
   
   setTimeout(async () => {
@@ -529,6 +528,59 @@ router.post('/heartbeat', authenticateMachine, async (req, res) => {
     res.status(500).json({ error: 'Heartbeat failed' });
   }
 });
+
+// POST /api/edge/refresh-token - Edge/Pi token renewal
+router.post('/refresh-token', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({ error: 'Missing refreshToken' });
+    }
+
+    // Verify and decode the refresh token
+    const decoded = jwt.verify(
+      refreshToken,
+      process.env.MACHINE_JWT_SECRET || process.env.JWT_SECRET,
+      {
+        audience: 'gambino-edge',
+        issuer: 'gambino-server'
+      }
+    );
+
+    // Ensure it's a machine/edge/hub token
+    if (!['machine', 'edge_device', 'hub'].includes(decoded.type)) {
+      return res.status(401).json({ error: 'Invalid token type' });
+    }
+
+    const newAccessToken = jwt.sign(
+      {
+        machineId: decoded.machineId,
+        hubId: decoded.hubId,
+        storeId: decoded.storeId,
+        type: decoded.type
+      },
+      process.env.MACHINE_JWT_SECRET || process.env.JWT_SECRET,
+      {
+        expiresIn: '15m',
+        audience: 'gambino-edge',
+        issuer: 'gambino-server'
+      }
+    );
+
+    console.log(`🔁 Token refreshed for ${decoded.machineId || decoded.hubId}`);
+
+    return res.json({
+      success: true,
+      accessToken: newAccessToken,
+      expiresIn: 900
+    });
+  } catch (error) {
+    console.error('❌ Refresh token error:', error);
+    return res.status(401).json({ error: 'Invalid or expired refreshToken' });
+  }
+});
+
 
 module.exports = router;
 module.exports.authenticateMachine = authenticateMachine;

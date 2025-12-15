@@ -654,4 +654,126 @@ router.get('/admin/stores/:storeId/events',
   }
 );
 
+// GET /api/admin/stores-with-status - Get all stores with hub counts and connectivity status
+const Hub = require('../models/Hub');
+
+router.get('/admin/stores-with-status',
+  authenticate,
+  requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]),
+  async (req, res) => {
+    try {
+      const userRole = req.user.role;
+      let storeQuery = {};
+
+      // Venue managers/staff only see their assigned stores
+      if (['venue_manager', 'venue_staff'].includes(userRole)) {
+        storeQuery = { storeId: { $in: req.user.assignedVenues || [] } };
+      }
+
+      // Get all stores
+      const stores = await Store.find(storeQuery).lean();
+
+      // Get hub counts per store
+      const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
+
+      // Aggregate hub data per store
+      const hubStats = await Hub.aggregate([
+        {
+          $group: {
+            _id: '$storeId',
+            hubCount: { $sum: 1 },
+            hubsOnline: {
+              $sum: {
+                $cond: [
+                  { $and: [
+                    { $gte: ['$lastHeartbeat', twoMinutesAgo] },
+                    { $eq: ['$status', 'online'] }
+                  ]},
+                  1,
+                  0
+                ]
+              }
+            },
+            hubs: {
+              $push: {
+                hubId: '$hubId',
+                name: '$name',
+                status: '$status',
+                lastHeartbeat: '$lastHeartbeat',
+                isOnline: {
+                  $and: [
+                    { $gte: ['$lastHeartbeat', twoMinutesAgo] },
+                    { $eq: ['$status', 'online'] }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]);
+
+      // Create lookup map for hub stats
+      const hubStatsMap = {};
+      hubStats.forEach(stat => {
+        hubStatsMap[stat._id] = stat;
+      });
+
+      // Get machine counts per store
+      const machineCounts = await Machine.aggregate([
+        { $group: { _id: '$storeId', count: { $sum: 1 } } }
+      ]);
+      const machineCountMap = {};
+      machineCounts.forEach(mc => {
+        machineCountMap[mc._id] = mc.count;
+      });
+
+      // Enrich stores with hub data
+      const enrichedStores = stores.map(store => {
+        const stats = hubStatsMap[store.storeId] || { hubCount: 0, hubsOnline: 0, hubs: [] };
+        const machinesCount = machineCountMap[store.storeId] || 0;
+
+        // Determine connectivity status
+        let connectivityStatus = 'offline';
+        if (stats.hubCount > 0) {
+          if (stats.hubsOnline > 0) {
+            connectivityStatus = 'online';
+          }
+        } else {
+          connectivityStatus = 'unknown'; // No hubs registered
+        }
+
+        return {
+          ...store,
+          hubCount: stats.hubCount,
+          hubsOnline: stats.hubsOnline,
+          hubsCount: stats.hubCount, // Alias for frontend compatibility
+          hubs: stats.hubs,
+          machinesCount,
+          connectivityStatus
+        };
+      });
+
+      // Sort by store name
+      enrichedStores.sort((a, b) => (a.storeName || '').localeCompare(b.storeName || ''));
+
+      res.json({
+        success: true,
+        stores: enrichedStores,
+        total: enrichedStores.length,
+        summary: {
+          totalStores: enrichedStores.length,
+          onlineStores: enrichedStores.filter(s => s.connectivityStatus === 'online').length,
+          offlineStores: enrichedStores.filter(s => s.connectivityStatus === 'offline').length,
+          totalHubs: enrichedStores.reduce((sum, s) => sum + (s.hubCount || 0), 0),
+          onlineHubs: enrichedStores.reduce((sum, s) => sum + (s.hubsOnline || 0), 0)
+        }
+      });
+
+    } catch (error) {
+      console.error('Stores with status error:', error);
+      res.status(500).json({ error: 'Failed to fetch stores' });
+    }
+  }
+);
+
 module.exports = router;

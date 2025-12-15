@@ -148,6 +148,7 @@ eventSchema.statics.findByStore = function(storeId, startDate, endDate, eventTyp
   return this.find(query).sort({ timestamp: -1 });
 };
 
+// FIXED: Use Math.max for cumulative events, not +=
 eventSchema.statics.getDailySummary = async function(storeId, date) {
   const startOfDay = new Date(date);
   startOfDay.setHours(0, 0, 0, 0);
@@ -164,11 +165,8 @@ eventSchema.statics.getDailySummary = async function(storeId, date) {
     eventType: { $in: ['money_in', 'money_out', 'collect', 'voucher', 'voucher_print'] }
   }).lean();
   
-  // Group by machine
+  // Group by machine - USE MAX FOR CUMULATIVE, SUM FOR TRANSACTIONS
   const machineData = {};
-  let totalMoneyIn = 0;
-  let totalMoneyOut = 0;  // ← ADD THIS
-  let totalCollect = 0;
   
   events.forEach(event => {
     const machineId = event.gamingMachineId;
@@ -177,8 +175,9 @@ eventSchema.statics.getDailySummary = async function(storeId, date) {
       machineData[machineId] = {
         machineId: machineId,
         moneyIn: 0,
-        moneyOut: 0,  // ← ADD THIS
+        moneyOut: 0,
         collect: 0,
+        vouchers: 0,
         transactionCount: 0
       };
     }
@@ -186,33 +185,44 @@ eventSchema.statics.getDailySummary = async function(storeId, date) {
     const machine = machineData[machineId];
     machine.transactionCount++;
     
+    // FIXED: Use Math.max for cumulative events (snapshots that reset)
     if (event.eventType === 'money_in') {
-      machine.moneyIn += event.amount || 0;
-      totalMoneyIn += event.amount || 0;
+      machine.moneyIn = Math.max(machine.moneyIn, event.amount || 0);
     } 
-    // ← ADD THIS ENTIRE BLOCK
     else if (event.eventType === 'money_out') {
-      machine.moneyOut += event.amount || 0;
-      totalMoneyOut += event.amount || 0;
+      machine.moneyOut = Math.max(machine.moneyOut, event.amount || 0);
     }
     else if (event.eventType === 'collect') {
-      machine.collect += event.amount || 0;
-      totalCollect += event.amount || 0;
+      machine.collect = Math.max(machine.collect, event.amount || 0);
+    }
+    // Use SUM for discrete transaction events
+    else if (event.eventType === 'voucher' || event.eventType === 'voucher_print') {
+      machine.vouchers += event.amount || 0;
     }
   });
   
-  // Calculate net revenue per machine
+  // Calculate totals and net revenue per machine
+  let totalMoneyIn = 0;
+  let totalMoneyOut = 0;
+  let totalCollect = 0;
+  let totalVouchers = 0;
+  
   Object.values(machineData).forEach(machine => {
-    machine.netRevenue = machine.moneyIn - machine.moneyOut - machine.collect;  // ← CHANGE THIS
+    totalMoneyIn += machine.moneyIn;
+    totalMoneyOut += machine.moneyOut;
+    totalCollect += machine.collect;
+    totalVouchers += machine.vouchers;
+    machine.netRevenue = machine.moneyIn - machine.moneyOut - machine.collect - machine.vouchers;
   });
   
   return {
     storeId,
     date: date,
     totalMoneyIn,
-    totalMoneyOut,  // ← ADD THIS
+    totalMoneyOut,
     totalCollect,
-    totalRevenue: totalMoneyIn - totalMoneyOut - totalCollect,  // ← CHANGE THIS
+    totalVouchers,
+    totalRevenue: totalMoneyIn - totalMoneyOut - totalCollect - totalVouchers,
     machineData: Object.values(machineData),
     machineCount: Object.keys(machineData).length,
     eventCount: events.length

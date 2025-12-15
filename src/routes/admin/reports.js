@@ -449,44 +449,53 @@ router.get('/:storeId/cumulative/:date', async (req, res, next) => {
       const endOfDay = new Date(targetDate);
       endOfDay.setHours(23, 59, 59, 999);
       console.log(`📊 Cumulative totals for ${storeId} on ${date}`);
-      const results = await Event.aggregate([
-        { $match: { storeId: storeId, timestamp: { $gte: startOfDay, $lte: endOfDay }, eventType: { $in: ['money_in', 'money_out', 'voucher_print'] } } },
-        { $group: { _id: { machineId: '$gamingMachineId', eventType: '$eventType' }, totalAmount: { $sum: '$amount' }, count: { $sum: 1 }, lastTimestamp: { $max: '$timestamp' } } },
-        { $sort: { '_id.machineId': 1, '_id.eventType': 1 } }
-      ]);
-      const machineData = {};
-      let totalMoneyIn = 0, totalMoneyOut = 0, totalVouchers = 0, voucherCount = 0;
-      results.forEach(item => {
-        const machineId = item._id.machineId;
-        const eventType = item._id.eventType;
-        if (!machineData[machineId]) {
-          machineData[machineId] = { machineId: machineId, moneyIn: 0, moneyOut: 0, vouchers: 0, voucherCount: 0, netRevenue: 0, lastActivity: null };
-        }
-        if (eventType === 'money_in') {
-          machineData[machineId].moneyIn = item.totalAmount;
-          totalMoneyIn += item.totalAmount;
-        } else if (eventType === 'money_out') {
-          machineData[machineId].moneyOut = item.totalAmount;
-          totalMoneyOut += item.totalAmount;
-        } else if (eventType === 'voucher_print') {
-          machineData[machineId].vouchers = item.totalAmount;
-          machineData[machineId].voucherCount = item.count;
-          totalVouchers += item.totalAmount;
-          voucherCount += item.count;
-        }
-        if (!machineData[machineId].lastActivity || item.lastTimestamp > machineData[machineId].lastActivity) {
-          machineData[machineId].lastActivity = item.lastTimestamp;
-        }
-      });
-      Object.values(machineData).forEach(machine => {
-        machine.netRevenue = machine.moneyIn - machine.moneyOut;
-      });
-      const machines = Object.values(machineData).sort((a, b) => b.netRevenue - a.netRevenue);
-      const netRevenue = totalMoneyIn - totalMoneyOut;
+      
+      // FIXED: Query dailyreports instead of events (handles daily_summary data)
+      const reports = await DailyReport.find({
+        storeId: storeId,
+        reportDate: { $gte: startOfDay, $lte: endOfDay },
+        reconciliationStatus: { $ne: 'excluded' }
+      }).sort({ printedAt: -1 }).lean();
+      
+      if (reports.length === 0) {
+        console.log(`   ⚠️  No daily reports found for ${date}`);
+        return res.json({
+          success: true,
+          date: date,
+          storeId: storeId,
+          dataSource: 'daily_reports',
+          totalMoneyIn: 0,
+          totalMoneyOut: 0,
+          netRevenue: 0,
+          machines: []
+        });
+      }
+      
+      // Use LATEST report for the day (highest values)
+      const latestReport = reports[0];
+      console.log(`   📊 Using latest report (${reports.length} total) - IN: $${latestReport.totalMoneyIn}, Revenue: $${latestReport.totalRevenue}`);
+      
+      // Also get voucher events for voucher count
+      const voucherEvents = await Event.find({
+        storeId: storeId,
+        eventType: { $in: ['voucher_print', 'voucher'] },
+        timestamp: { $gte: startOfDay, $lte: endOfDay }
+      }).lean();
+      
+      const voucherTotal = voucherEvents.reduce((sum, e) => sum + (e.amount || 0), 0);
+      const voucherCount = voucherEvents.length;
+      
       res.json({
-        success: true, date: date, storeId: storeId, dataSource: 'real_time_events',
-        totalMoneyIn: totalMoneyIn, totalMoneyOut: totalMoneyOut, netRevenue: netRevenue,
-        voucherCount: voucherCount, voucherTotal: totalVouchers, machines: machines
+        success: true,
+        date: date,
+        storeId: storeId,
+        dataSource: 'daily_reports',
+        totalMoneyIn: latestReport.totalMoneyIn || 0,
+        totalMoneyOut: latestReport.totalCollect || 0,
+        netRevenue: latestReport.totalRevenue || 0,
+        voucherCount: voucherCount,
+        voucherTotal: voucherTotal,
+        machines: latestReport.machineData || []
       });
     } catch (error) {
       console.error('❌ Error fetching cumulative totals:', error);

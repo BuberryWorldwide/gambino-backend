@@ -26,7 +26,7 @@ const hubSchema = new mongoose.Schema({
   // Connection status
   status: {
     type: String,
-    enum: ['online', 'offline', 'error', 'maintenance'],
+    enum: ['online', 'offline', 'error', 'maintenance', 'restarting'],
     default: 'offline'
   },
   
