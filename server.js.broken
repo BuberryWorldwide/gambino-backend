@@ -135,13 +135,12 @@ const SYSTEM_WALLETS = {
 // --- CORS CONFIGURATION ---
 const ALLOW = [
   /^https:\/\/.*\.vercel\.app$/,
-  'https://app.gambino.gold',
-  'https://mine.gambino.gold',
+  
+  
   'http://localhost:3000',
   'http://localhost:3002',
   'http://localhost:3003',
   'http://localhost:3004',
-  'http://localhost:3005',
   'http://localhost:8081',
   'http://localhost:5173',
   'https://gambino.gold',
@@ -149,7 +148,7 @@ const ALLOW = [
   'http://192.168.1.235:3002',
   'http://192.168.1.235:3003',
   'http://192.168.1.235:3004',  // ADD THIS
-  'https://mine.gambino.gold',
+  
   'https://admin.gambino.gold'
 ];
 const corsOptions = {
@@ -685,7 +684,7 @@ app.use('/api/wallet', transferRoutes);
 // Transaction Schema
 const transactionSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  type: { type: String, enum: ['purchase', 'jackpot', 'burn', 'tier_reward'], required: true },
+  type: { type: String, enum: ['purchase', 'jackpot', 'burn', 'tier_reward', 'cashout', 'cashout_reversal'], required: true },
   amount: { type: Number, required: true },
   usdAmount: Number,
   machineId: String,
@@ -698,6 +697,8 @@ const transactionSchema = new mongoose.Schema({
 
 transactionSchema.index({ userId: 1, createdAt: -1 });
 transactionSchema.index({ type: 1 });
+transactionSchema.index({ 'metadata.storeId': 1, createdAt: -1 }); // For cashout queries
+transactionSchema.index({ 'metadata.staffMemberId': 1, createdAt: -1 }); // For staff cashout tracking
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 //Reconciliation Service
@@ -1955,7 +1956,7 @@ app.use('/api/machines', require('./src/routes/machines'));
 app.use('/api/admin/machines', require('./src/routes/routes-machine-details'));
 
 // HUB MANAGEMENT (remove duplicate)
-app.use('/api/admin/hubs', require('./src/routes/hubs'));
+// REMOVED: Duplicate hubs mount (cleanup script)
 
 // EDGE DEVICE OPERATIONS
 app.use('/api/edge', require('./src/routes/edge'));
@@ -1972,224 +1973,11 @@ app.use('/api', require('./src/routes/analytics'));
 
 
 
-// BASIC LEADERBOARD (SIMPLIFIED)
-app.get('/api/leaderboard', async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '50', 10), 100);
+// REMOVED: Inline leaderboard route (manual cleanup)
+// Moved to entropy-game-backend
 
-    const topUsers = await User.find({ 
-      isActive: { $ne: false },
-      gambinoBalance: { $gt: 0 }
-    })
-    .sort({ gambinoBalance: -1 })
-    .limit(limit)
-    .select('firstName lastName email walletAddress role isActive createdAt assignedVenues')
-    .lean();
-
-    const leaderboard = topUsers.map((user, index) => ({
-      rank: index + 1,
-      name: `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Anonymous Player',
-      email: user.email ? user.email.replace(/(.{2})(.*)(@.*)/, '$1***$3') : 'N/A',
-      balance: user.gambinoBalance || 0,
-      totalJackpots: user.totalJackpots || 0,
-      majorJackpots: user.majorJackpots || 0,
-      minorJackpots: user.minorJackpots || 0,
-      memberSince: user.createdAt
-    }));
-
-    const totalCirculating = leaderboard.reduce((sum, user) => sum + user.balance, 0);
-    
-    res.json({
-      success: true,
-      leaderboard,
-      stats: {
-        totalPlayers: leaderboard.length,
-        totalCirculating,
-        lastUpdated: new Date(),
-        dataSource: 'database'
-      }
-    });
-  } catch (error) {
-    console.error('Leaderboard error:', error);
-    res.status(500).json({ error: 'Failed to load leaderboard' });
-  }
-});
-
-console.log('📱 Loading mobile mining routes...');
-
-// Your existing MiningSession model (already created)
-const MiningSession = require('./src/models/MiningSession');
-
-// Import mobile-specific models (you'll need to create these)
-const EscrowBalance = require('./src/models/EscrowBalance');
-const MobileCredit = require('./src/models/MobileCredit');
-
-// Import mobile mining routes
-const { router: miningRouterBase, setupMiningRoutes } = require('./src/routes/mining');
-const { router: mobileRouterBase, setupMobileRoutes } = require('./src/routes/mobile');
-
-// Setup routes with dependencies and CAPTURE the returned router
-const miningRouter = setupMiningRoutes({
-  MiningSession,
-  EscrowBalance,
-  authenticate
-});
-
-const mobileRouter = setupMobileRoutes({
-  EscrowBalance,
-  MobileCredit,
-  authenticate
-});
-
-
-
-// Mount routes
-app.use('/api/mining', miningRouter);
-app.use('/api/mobile', mobileRouter);
-
-console.log('✅ Mobile mining routes mounted:');
-console.log('   📱 Mining Endpoints:');
-console.log('      POST   /api/mining/start-session');
-console.log('      POST   /api/mining/submit-entropy');
-console.log('      POST   /api/mining/end-session');
-console.log('      GET    /api/mining/active-session');
-console.log('      GET    /api/mining/stats');
-console.log('      GET    /api/mining/history');
-console.log('   💰 Mobile Endpoints:');
-console.log('      GET    /api/mobile/escrow/balance');
-console.log('      GET    /api/mobile/credits/balance');
-console.log('      POST   /api/mobile/credits/purchase');
-console.log('      POST   /api/mobile/credits/use');
-console.log('      POST   /api/mobile/escrow/withdraw');
-console.log('      GET    /api/mobile/account/summary');
-
-// ============================================
-// END MOBILE MINING INTEGRATION
+// REMOVED: Mobile mining integration (cleanup script)
 // ============================================
 
 // ===== ENTROPY ROUTES =====
-console.log('🎲 Loading entropy routes...');
-const { router: entropyRouter, setupEntropyRoutes } = require('./src/routes/entropy');
-
-// Setup entropy routes with dependencies
-setupEntropyRoutes({
-  authenticate,        // Already defined above (from RBAC)
-  redisClient,         // Already defined above
-  User,               // Already defined above
-  EntropySession: require('./src/models/EntropySession')
-});
-
-app.use('/api/entropy', entropyRouter);
-console.log('✅ Entropy routes mounted:');
-console.log('   🎲 POST   /api/entropy/work/start');
-console.log('   🎲 POST   /api/entropy/work/reveal');
-console.log('   🎲 GET    /api/entropy/stats');
-
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('❌ Server error:', error);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// User venue assignment migration
-const migrateExistingUsers = async () => {
-  try {
-    console.log('🔄 Starting user venue assignment migration...');
-    
-    const result = await User.updateMany(
-      { assignedVenues: { $exists: false } },
-      { $set: { assignedVenues: [] } }
-    );
-    
-    console.log(`✅ Migration complete: ${result.modifiedCount} users updated with empty assignedVenues`);
-    return true;
-  } catch (error) {
-    console.error('❌ User migration failed:', error);
-    return false;
-  }
-};
-
-// ONE-TIME MIGRATION: Backfill wallet creation dates for existing wallets
-const backfillWalletDates = async () => {
-  try {
-    console.log('🔄 Starting wallet date backfill migration...');
-    
-    // Find all users with wallets but no walletCreatedAt
-    const usersNeedingBackfill = await User.find({
-      walletAddress: { $exists: true, $ne: null },
-      walletCreatedAt: { $exists: false }
-    });
-
-    console.log(`📊 Found ${usersNeedingBackfill.length} wallets to backfill`);
-
-    for (const user of usersNeedingBackfill) {
-      // Set wallet creation date to account creation date (best guess)
-      user.walletCreatedAt = user.createdAt;
-      
-      // Try to determine wallet type based on privateKey presence
-      if (user.privateKey && user.privateKeyIV) {
-        user.walletType = 'generated';
-      } else {
-        user.walletType = 'connected';
-      }
-      
-      await user.save();
-    }
-
-    console.log(`✅ Backfilled ${usersNeedingBackfill.length} wallet records`);
-    return true;
-  } catch (error) {
-    console.error('❌ Wallet backfill migration failed:', error);
-    return false;
-  }
-};
-
-
-
-
-// ENHANCED SERVER STARTUP
-const startServer = async () => {
-  try {
-    // 1. Connect to MongoDB
-    await connectDB();
-    
-    // 2. Run user venue assignment migration
-    await migrateExistingUsers();
-
-    // 3. Backfill wallet dates (ADD THIS LINE) 👇
-    await backfillWalletDates();
-    
-    // 4. Run session database repair
-    console.log('🔧 Repairing session database...');
-    const repairSuccess = await repairSessionDatabase();
-    
-    if (!repairSuccess) {
-      console.log('⚠️ Session repair had issues, but continuing startup...');
-    }
-    
-    // 4. Connect to Redis
-    await connectRedis();
-    
-    // 5. Clean up old sessions
-    await cleanupOldSessions();
-    
-    // 6. Start the server
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🎰 Gambino Backend running on port ${PORT}`);
-      console.log(`🔗 Health: http://localhost:${PORT}/health`);
-      console.log(`✅ Session database verified and ready`);
-    });
-    
-  } catch (e) {
-    console.error('❌ Failed to start server:', e);
-    process.exit(1);
-  }
-};
-
-// Start the server
-startServer();
+// REMOVED: Entropy routes (cleanup script)
