@@ -1,81 +1,165 @@
-// blockchainTreasuryRoutes.js - Create this file in your backend root directory
 require("dotenv").config({ path: "/opt/gambino/.env" });
 const express = require("express");
 const router = express.Router();
-const { Connection, PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { Connection, PublicKey } = require('@solana/web3.js');
 const { getAssociatedTokenAddress, getAccount } = require('@solana/spl-token');
+const CredentialManager = require('../services/credentialManager');
 
 class BlockchainTreasuryService {
   constructor() {
-    // Use your exact CLI configuration
-    this.network = process.env.SOLANA_NETWORK || 'mainnet-beta';
-    this.rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+    // Network configuration - easily switchable
+    this.network = process.env.SOLANA_NETWORK || 'devnet';
+    this.rpcUrl = this.getRpcUrl();
     this.connection = new Connection(this.rpcUrl, 'confirmed');
     
-    // Token configuration - exact match to your CLI
-    this.gambinoMint = new PublicKey(process.env.GAMBINO_MINT_ADDRESS || 'Cd2wZyKVdWuyuJJHmeU1WmfSKNnDHku2m6mt6XFqGeXn');
-    this.tokenDecimals = parseInt(process.env.GAMBINO_DECIMALS || '6');
+    // Token configuration
+    this.gambinoMint = process.env.GAMBINO_MINT_ADDRESS ? 
+      new PublicKey(process.env.GAMBINO_MINT_ADDRESS) : null;
+    this.tokenDecimals = parseInt(process.env.GAMBINO_DECIMALS) || 6;
     
-    // Rate limiting from your CLI
-    this.rateLimitDelay = Number(process.env.RPC_PACE_MS || 200);
+    this.credentialManager = new CredentialManager();
+    console.log("🔍 Treasury vault path:", this.credentialManager.vaultPath);
+    console.log("🔍 Treasury service working directory:", process.cwd());
     
-    console.log(`Treasury API initialized on ${this.network}`);
-    console.log(`RPC URL: ${this.rpcUrl}`);
-    console.log(`GAMBINO: ${this.gambinoMint.toBase58()}`);
+    console.log(`🌐 Treasury API initialized on ${this.network}`);
+    console.log(`📡 RPC URL: ${this.rpcUrl}`);
   }
 
-  // Exact copy of your CLI's sleep function
-  async sleep(ms = 0) {
-    if (!ms || ms <= 0) return Promise.resolve();
-    return new Promise(resolve => setTimeout(resolve, ms));
+  getRpcUrl() {
+    // Environment-based RPC selection for easy mainnet switch
+    if (process.env.SOLANA_RPC_URL) {
+      return process.env.SOLANA_RPC_URL;
+    }
+    
+    switch (this.network) {
+      case 'mainnet':
+      case 'mainnet-beta':
+        return process.env.MAINNET_RPC_URL || 'https://api.mainnet-beta.solana.com';
+      case 'testnet':
+        return 'https://api.testnet.solana.com';
+      case 'devnet':
+      default:
+        return 'https://api.devnet.solana.com';
+    }
   }
 
-  // Exact copy of your CLI's _getSolBalance method
-  async _getSolBalance(pubkey) {
+    async getAllTreasuryBalances() {
     try {
-      const lamports = await this.connection.getBalance(pubkey);
-      return lamports / LAMPORTS_PER_SOL;
+      // Get all credential accounts
+      const credentialsResult = await this.credentialManager.listCredentials();
+
+      if (!credentialsResult.success) {
+        throw new Error('Failed to load treasury credentials');
+      }
+
+      const balances = [];
+      let totalTokenBalance = 0;
+      let totalSolBalance = 0;
+
+      // Process each treasury account
+      for (const credential of credentialsResult.credentials) {
+        try {
+          // Just use stored metadata.publicKey directly
+          const pubKey = credential.metadata.publicKey;
+          if (!pubKey) continue;
+
+          const balance = await this.getAccountBalance(pubKey);
+
+          if (balance.success) {
+            balances.push({
+              accountType: credential.accountType,
+              label: credential.metadata.label || credential.accountType,
+              securityLevel: credential.securityLevel,
+              publicKey: pubKey,
+              solBalance: balance.solBalance,
+              tokenBalance: balance.tokenBalance,
+              tokenAccount: balance.tokenAccount,
+              percentage: credential.metadata.percentage || 0,
+              status: 'HEALTHY',
+              lastChecked: new Date().toISOString(),
+              network: this.network
+            });
+
+            totalTokenBalance += balance.tokenBalance;
+            totalSolBalance += balance.solBalance;
+          } else {
+            balances.push({
+              accountType: credential.accountType,
+              label: credential.metadata.label,
+              securityLevel: credential.securityLevel,
+              publicKey: pubKey,
+              solBalance: 0,
+              tokenBalance: 0,
+              tokenAccount: null,
+              status: 'ERROR',
+              error: balance.error,
+              lastChecked: new Date().toISOString(),
+              network: this.network
+            });
+          }
+        } catch (error) {
+          console.error(`Error processing ${credential.accountType}:`, error);
+        }
+      }
+
+      return {
+        success: true,
+        accounts: balances,
+        summary: {
+          totalAccounts: balances.length,
+          totalTokenBalance,
+          totalSolBalance,
+          healthyAccounts: balances.filter(a => a.status === 'HEALTHY').length,
+          network: this.network,
+          tokenSymbol: 'GAMBINO',
+          lastUpdated: new Date().toISOString()
+        }
+      };
+
     } catch (error) {
-      console.error(`SOL balance error for ${pubkey.toString()}:`, error.message);
-      return 0;
+      return {
+        success: false,
+        error: error.message
+      };
     }
   }
 
-  // Exact copy of your CLI's _getTokenUiAmount method
-  async _getTokenUiAmount(ownerPubkey, mintPubkey) {
-    try {
-      // Exact ATA lookup (no owner scan)
-      const ata = await getAssociatedTokenAddress(mintPubkey, ownerPubkey);
-      const acc = await getAccount(this.connection, ata);
-      return Number(acc.amount) / (10 ** this.tokenDecimals);
-    } catch {
-      return 0; // no ATA
-    }
-  }
 
   async getAccountBalance(publicKeyString) {
     try {
       const publicKey = new PublicKey(publicKeyString);
       
-      // Use your CLI's exact methods
-      const solBalance = await this._getSolBalance(publicKey);
-      const tokenBalance = await this._getTokenUiAmount(publicKey, this.gambinoMint);
+      // Get SOL balance
+      const solBalance = await this.connection.getBalance(publicKey);
       
-      // Get token account if exists
+      let tokenBalance = 0;
       let tokenAccount = null;
-      if (tokenBalance > 0) {
+      
+      // Get GAMBINO token balance if mint is configured
+      if (this.gambinoMint) {
         try {
-          const ata = await getAssociatedTokenAddress(this.gambinoMint, publicKey);
-          tokenAccount = ata.toString();
-        } catch {
-          // ignore
+          const tokenAccountAddress = await getAssociatedTokenAddress(
+            this.gambinoMint,
+            publicKey
+          );
+          
+          const tokenAccountInfo = await getAccount(
+            this.connection,
+            tokenAccountAddress
+          );
+          
+          tokenBalance = Number(tokenAccountInfo.amount) / Math.pow(10, this.tokenDecimals);
+          tokenAccount = tokenAccountAddress.toString();
+        } catch (error) {
+          // Token account might not exist yet - that's okay
+          console.log(`No token account found for ${publicKeyString.substring(0, 8)}...`);
         }
       }
 
       return {
         success: true,
         publicKey: publicKeyString,
-        solBalance,
+        solBalance: solBalance / 1e9, // Convert lamports to SOL
         tokenBalance,
         tokenAccount,
         network: this.network
@@ -92,66 +176,77 @@ class BlockchainTreasuryService {
 
   async getAllTreasuryBalances() {
     try {
-      console.log('Fetching all treasury balances from blockchain...');
+      // Get all credential accounts
+      const credentialsResult = await this.credentialManager.listCredentials();
       
-      const accounts = [];
+      if (!credentialsResult.success) {
+        throw new Error('Failed to load treasury credentials');
+      }
+
+      const balances = [];
       let totalTokenBalance = 0;
       let totalSolBalance = 0;
 
-      // Use environment variable treasury addresses (like your CLI)
-      const envTreasuries = {
-        main: process.env.MAIN_TREASURY_PUBLIC_KEY,
-        jackpot: process.env.JACKPOT_TREASURY_PUBLIC_KEY, 
-        operations: process.env.OPERATIONS_TREASURY_PUBLIC_KEY,
-        team: process.env.TEAM_TREASURY_PUBLIC_KEY,
-        community: process.env.COMMUNITY_TREASURY_PUBLIC_KEY,
-        payer: process.env.PAYER_PUBLIC_KEY
-      };
-
-      for (const [name, publicKeyString] of Object.entries(envTreasuries)) {
-        if (!publicKeyString) continue;
-
+      // Process each treasury account
+      for (const credential of credentialsResult.credentials) {
         try {
-          const balance = await this.getAccountBalance(publicKeyString);
+          // Get the actual credentials to access public key
+          const credResult = await this.credentialManager.retrieveCredentials(
+            credential.accountType, 
+            'BALANCE_CHECK'
+          );
           
-          if (balance.success) {
-            accounts.push({
-              accountType: name,
-              label: name.toUpperCase(),
-              securityLevel: 'MEDIUM',
-              publicKey: publicKeyString,
-              solBalance: balance.solBalance,
-              tokenBalance: balance.tokenBalance,
-              tokenAccount: balance.tokenAccount,
-              percentage: 0,
-              status: 'HEALTHY',
-              lastChecked: new Date().toISOString(),
-              network: this.network
-            });
+          if (credResult.success && credResult.credentials.publicKey) {
+            const balance = await this.getAccountBalance(credResult.credentials.publicKey);
+            
+            if (balance.success) {
+              const accountData = {
+                accountType: credential.accountType,
+                label: credResult.credentials.label || credential.metadata.label,
+                securityLevel: credential.securityLevel,
+                publicKey: credResult.credentials.publicKey,
+                solBalance: balance.solBalance,
+                tokenBalance: balance.tokenBalance,
+                tokenAccount: balance.tokenAccount,
+                percentage: credResult.credentials.percentage || 0,
+                status: 'HEALTHY',
+                lastChecked: new Date().toISOString(),
+                network: this.network
+              };
 
-            totalTokenBalance += balance.tokenBalance;
-            totalSolBalance += balance.solBalance;
-          }
-
-          // Rate limiting
-          if (this.rateLimitDelay > 0) {
-            await this.sleep(this.rateLimitDelay);
+              balances.push(accountData);
+              totalTokenBalance += balance.tokenBalance;
+              totalSolBalance += balance.solBalance;
+            } else {
+              // Account exists but balance check failed
+              balances.push({
+                accountType: credential.accountType,
+                label: credential.metadata.label,
+                securityLevel: credential.securityLevel,
+                publicKey: credResult.credentials.publicKey,
+                solBalance: 0,
+                tokenBalance: 0,
+                tokenAccount: null,
+                status: 'ERROR',
+                error: balance.error,
+                lastChecked: new Date().toISOString(),
+                network: this.network
+              });
+            }
           }
         } catch (error) {
-          console.error(`Error processing ${name}:`, error);
+          console.error(`Error processing ${credential.accountType}:`, error);
         }
       }
 
-      console.log(`Treasury summary: ${accounts.length} accounts, ${totalSolBalance.toFixed(4)} SOL, ${totalTokenBalance.toLocaleString()} GAMBINO`);
-
       return {
         success: true,
-        accounts,
+        accounts: balances,
         summary: {
-          totalAccounts: accounts.length,
+          totalAccounts: balances.length,
           totalTokenBalance,
           totalSolBalance,
-          healthyAccounts: accounts.filter(a => a.status === 'HEALTHY').length,
+          healthyAccounts: balances.filter(a => a.status === 'HEALTHY').length,
           network: this.network,
           tokenSymbol: 'GAMBINO',
           lastUpdated: new Date().toISOString()
@@ -159,7 +254,6 @@ class BlockchainTreasuryService {
       };
       
     } catch (error) {
-      console.error('getAllTreasuryBalances error:', error);
       return {
         success: false,
         error: error.message
@@ -180,9 +274,55 @@ class BlockchainTreasuryService {
         version: version['solana-core'],
         currentSlot: slot,
         blockTime: blockTime ? new Date(blockTime * 1000).toISOString() : null,
-        tokenMint: this.gambinoMint.toString(),
+        tokenMint: this.gambinoMint?.toString(),
         tokenDecimals: this.tokenDecimals
       };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  async getRecentTransactions(accountPublicKey, limit = 10) {
+    try {
+      const publicKey = new PublicKey(accountPublicKey);
+      const signatures = await this.connection.getSignaturesForAddress(
+        publicKey,
+        { limit }
+      );
+
+      const transactions = [];
+      
+      for (const sig of signatures) {
+        try {
+          const tx = await this.connection.getTransaction(sig.signature, {
+            maxSupportedTransactionVersion: 0
+          });
+          
+          if (tx) {
+            transactions.push({
+              signature: sig.signature,
+              slot: sig.slot,
+              blockTime: sig.blockTime ? new Date(sig.blockTime * 1000).toISOString() : null,
+              fee: tx.meta?.fee || 0,
+              status: tx.meta?.err ? 'failed' : 'success',
+              accounts: tx.transaction.message.accountKeys.map(key => key.toString())
+            });
+          }
+        } catch (error) {
+          console.error(`Error fetching transaction ${sig.signature}:`, error);
+        }
+      }
+
+      return {
+        success: true,
+        transactions,
+        account: accountPublicKey,
+        network: this.network
+      };
+      
     } catch (error) {
       return {
         success: false,
@@ -197,18 +337,12 @@ const treasuryService = new BlockchainTreasuryService();
 
 // Admin authentication middleware
 const authenticateAdmin = (req, res, next) => {
-  // Check if user is authenticated via JWT (from the main auth middleware)
-  if (req.user && ['super_admin', 'gambino_ops'].includes(req.user.role)) {
-    return next();
-  }
-  
-  // Fallback to admin key if no JWT user
   const adminKey = req.headers['x-admin-key'];
-  if (adminKey && adminKey === process.env.ADMIN_API_KEY) {
-    return next();
+  // SECURITY: Never log credentials - removed debug logging
+  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Admin access required' });
   }
-  
-  return res.status(401).json({ error: 'Admin access required' });
+  next();
 };
 
 // =================== BLOCKCHAIN TREASURY ROUTES ===================
@@ -216,7 +350,7 @@ const authenticateAdmin = (req, res, next) => {
 // Get all treasury account balances from blockchain
 router.get('/balances', authenticateAdmin, async (req, res) => {
   try {
-    console.log('Fetching all treasury balances from blockchain...');
+    console.log('📊 Fetching all treasury balances from blockchain...');
     
     const result = await treasuryService.getAllTreasuryBalances();
     
@@ -227,7 +361,7 @@ router.get('/balances', authenticateAdmin, async (req, res) => {
       });
     }
 
-    console.log(`Retrieved balances for ${result.accounts.length} accounts`);
+    console.log(`✅ Retrieved balances for ${result.accounts.length} accounts`);
     
     res.json({
       success: true,
@@ -240,7 +374,7 @@ router.get('/balances', authenticateAdmin, async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Treasury balances error:', error);
+    console.error('❌ Treasury balances error:', error);
     res.status(500).json({ 
       error: 'Failed to fetch treasury balances',
       network: treasuryService.network 
@@ -253,19 +387,21 @@ router.get('/balances/:accountType', authenticateAdmin, async (req, res) => {
   try {
     const { accountType } = req.params;
     
-    console.log(`Fetching balance for ${accountType}...`);
+    console.log(`📊 Fetching balance for ${accountType}...`);
     
-    // Get public key from environment
-    const publicKeyString = process.env[`${accountType.toUpperCase()}_TREASURY_PUBLIC_KEY`] || 
-                           process.env[`${accountType.toUpperCase()}_PUBLIC_KEY`];
+    // Get credentials for this account
+    const credResult = await treasuryService.credentialManager.retrieveCredentials(
+      accountType, 
+      'API_BALANCE_CHECK'
+    );
     
-    if (!publicKeyString) {
+    if (!credResult.success) {
       return res.status(404).json({ 
-        error: `Account ${accountType} not found in environment variables` 
+        error: `Account ${accountType} not found` 
       });
     }
 
-    const balance = await treasuryService.getAccountBalance(publicKeyString);
+    const balance = await treasuryService.getAccountBalance(credResult.credentials.publicKey);
     
     if (!balance.success) {
       return res.status(500).json({ 
@@ -278,8 +414,8 @@ router.get('/balances/:accountType', authenticateAdmin, async (req, res) => {
       success: true,
       data: {
         accountType,
-        label: accountType.toUpperCase(),
-        securityLevel: 'MEDIUM',
+        label: credResult.credentials.label,
+        securityLevel: credResult.securityLevel,
         ...balance
       },
       meta: {
@@ -289,7 +425,7 @@ router.get('/balances/:accountType', authenticateAdmin, async (req, res) => {
     });
     
   } catch (error) {
-    console.error(`Account balance error for ${req.params.accountType}:`, error);
+    console.error(`❌ Account balance error for ${req.params.accountType}:`, error);
     res.status(500).json({ 
       error: 'Failed to fetch account balance',
       accountType: req.params.accountType 
@@ -311,8 +447,55 @@ router.get('/network', authenticateAdmin, async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Network info error:', error);
+    console.error('❌ Network info error:', error);
     res.status(500).json({ error: 'Failed to fetch network information' });
+  }
+});
+
+// Get recent transactions for an account
+router.get('/transactions/:accountType', authenticateAdmin, async (req, res) => {
+  try {
+    const { accountType } = req.params;
+    const limit = parseInt(req.query.limit) || 10;
+    
+    console.log(`📜 Fetching transactions for ${accountType}...`);
+    
+    // Get credentials for this account
+    const credResult = await treasuryService.credentialManager.retrieveCredentials(
+      accountType, 
+      'TRANSACTION_HISTORY'
+    );
+    
+    if (!credResult.success) {
+      return res.status(404).json({ 
+        error: `Account ${accountType} not found` 
+      });
+    }
+
+    const transactions = await treasuryService.getRecentTransactions(
+      credResult.credentials.publicKey, 
+      limit
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        accountType,
+        publicKey: credResult.credentials.publicKey,
+        ...transactions
+      },
+      meta: {
+        network: treasuryService.network,
+        timestamp: new Date().toISOString()
+      }
+    });
+    
+  } catch (error) {
+    console.error(`❌ Transactions error for ${req.params.accountType}:`, error);
+    res.status(500).json({ 
+      error: 'Failed to fetch transactions',
+      accountType: req.params.accountType 
+    });
   }
 });
 
@@ -320,16 +503,22 @@ router.get('/network', authenticateAdmin, async (req, res) => {
 router.get('/health', async (req, res) => {
   try {
     const networkInfo = await treasuryService.getNetworkInfo();
+    const credentialsCheck = await treasuryService.credentialManager.verifyVaultIntegrity();
     
     res.json({
       success: true,
       health: {
         network: networkInfo.success ? 'HEALTHY' : 'ERROR',
+        credentials: credentialsCheck.success ? 'HEALTHY' : 'ERROR',
         service: 'HEALTHY',
         timestamp: new Date().toISOString()
       },
       details: {
-        network: networkInfo
+        network: networkInfo,
+        credentials: {
+          integrityScore: credentialsCheck.integrityScore,
+          accountsFound: credentialsCheck.results?.successfulDecryptions || 0
+        }
       }
     });
     
@@ -341,6 +530,34 @@ router.get('/health', async (req, res) => {
         timestamp: new Date().toISOString()
       },
       error: error.message
+    });
+  }
+});
+
+// Switch network endpoint (for testing)
+router.post('/switch-network', authenticateAdmin, async (req, res) => {
+  try {
+    const { network } = req.body;
+    
+    if (!['devnet', 'testnet', 'mainnet'].includes(network)) {
+      return res.status(400).json({ 
+        error: 'Invalid network. Must be devnet, testnet, or mainnet' 
+      });
+    }
+
+    // Update environment (this would require restart in production)
+    process.env.SOLANA_NETWORK = network;
+    
+    res.json({
+      success: true,
+      message: `Network switched to ${network}`,
+      note: 'Server restart required for full effect',
+      currentNetwork: treasuryService.network
+    });
+    
+  } catch (error) {
+    res.status(500).json({ 
+      error: 'Failed to switch network' 
     });
   }
 });

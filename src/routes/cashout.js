@@ -3,6 +3,7 @@ const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
 const CashoutService = require('../services/CashoutService');
+const GambinoTokenService = require('../services/gambinoTokenService');
 const { authenticate, requirePermission, requireVenueAccess, PERMISSIONS } = require('../middleware/rbac');
 
 /**
@@ -37,52 +38,85 @@ router.get(
  * Search customers for cashout (by phone, email, or name)
  * Permission: PROCESS_CASHOUTS or VIEW_CASHOUT_HISTORY
  */
-// Search customers - Line ~30-50
-router.get('/customers/search',
+router.get(
+  '/customers/search',
   authenticate,
-  requirePermission(PERMISSIONS.PROCESS_CASHOUTS),
+  requirePermission([PERMISSIONS.PROCESS_CASHOUTS, PERMISSIONS.VIEW_CASHOUT_HISTORY]),
   async (req, res) => {
     try {
-      const { q } = req.query;
+      const { q, limit = 20 } = req.query;
 
       if (!q || q.length < 2) {
-        return res.json({ customers: [] });
+        return res.status(400).json({
+          success: false,
+          error: 'Search query must be at least 2 characters'
+        });
       }
 
-      const searchRegex = new RegExp(q, 'i');
+      const User = mongoose.model('User');
 
-      // Search across ALL user fields
-      const customers = await mongoose.models.User.find({
+      // Search by email, phone, firstName, or lastName
+      const searchRegex = new RegExp(q, 'i');
+      const customers = await User.find({
         $or: [
-          { firstName: searchRegex },
-          { lastName: searchRegex },
           { email: searchRegex },
           { phone: searchRegex },
-          { username: searchRegex },
-          { walletAddress: searchRegex },
-          { 'wallet.address': searchRegex }
+          { firstName: searchRegex },
+          { lastName: searchRegex }
         ],
-        role: { $nin: ['super_admin'] } // Exclude only super admins
+        role: 'user' // Only search regular users (players)
       })
-      .select('firstName lastName email phone username walletAddress wallet balance gambinoBalance cachedGambinoBalance lastActivity createdAt')
-      .limit(10)
-      .lean();
+        .select('firstName lastName email phone gambinoBalance cachedGambinoBalance walletAddress lastActivity kycStatus kycVerifiedAt')
+        .limit(parseInt(limit))
+        .lean();
 
-      // Format results with full name and wallet info
-      const formattedCustomers = customers.map(c => ({
-        ...c,
-        fullName: `${c.firstName || ''} ${c.lastName || ''}`.trim() || c.username || c.email,
-        walletAddress: c.walletAddress || c.wallet?.address || 'No wallet',
-        balance: c.cachedGambinoBalance || c.gambinoBalance || c.balance || 0
-      }));
+      // Get on-chain balances for each customer (async)
+      const customersWithBalance = await Promise.all(
+        customers.map(async (c) => {
+          const tokenService = new GambinoTokenService();
+          let onChainBalance = 0;
+          let blockchainError = null;
 
-      res.json({ 
-        customers: formattedCustomers,
-        count: formattedCustomers.length 
+          if (c.walletAddress) {
+            try {
+              const balanceResult = await tokenService.getUserTokenBalance(c.walletAddress);
+              onChainBalance = balanceResult.success ? balanceResult.balance : 0;
+              blockchainError = balanceResult.success ? null : balanceResult.error;
+            } catch (err) {
+              console.error(`Failed to get blockchain balance for ${c.walletAddress}:`, err.message);
+              blockchainError = err.message;
+            }
+          }
+
+          return {
+            _id: c._id,
+            firstName: c.firstName,
+            lastName: c.lastName,
+            fullName: `${c.firstName} ${c.lastName}`,
+            email: c.email,
+            phone: c.phone,
+            balance: onChainBalance, // REAL on-chain balance
+            balanceCached: c.gambinoBalance || c.cachedGambinoBalance || 0, // MongoDB cache
+            walletAddress: c.walletAddress,
+            lastActivity: c.lastActivity,
+            blockchainError,
+            kycStatus: c.kycStatus || 'pending',
+            kycVerified: c.kycStatus === 'verified',
+            kycVerifiedAt: c.kycVerifiedAt
+          };
+        })
+      );
+
+      res.json({
+        success: true,
+        customers: customersWithBalance
       });
     } catch (error) {
       console.error('Customer search error:', error);
-      res.status(500).json({ error: 'Search failed' });
+      res.status(500).json({
+        success: false,
+        error: 'Failed to search customers'
+      });
     }
   }
 );
@@ -92,51 +126,117 @@ router.get('/customers/search',
  * Get customer balance details
  * Permission: PROCESS_CASHOUTS or VIEW_CASHOUT_HISTORY
  */
-router.get('/customers/search',
+router.get(
+  '/customers/:customerId/balance',
   authenticate,
-  requirePermission(PERMISSIONS.PROCESS_CASHOUTS),
+  requirePermission([PERMISSIONS.PROCESS_CASHOUTS, PERMISSIONS.VIEW_CASHOUT_HISTORY]),
   async (req, res) => {
     try {
-      const { q } = req.query;
+      const { customerId } = req.params;
+      const User = mongoose.model('User');
+      const Transaction = mongoose.model('Transaction');
 
-      if (!q || q.length < 2) {
-        return res.json({ customers: [] });
+      const customer = await User.findById(customerId)
+        .select('firstName lastName email phone gambinoBalance cachedGambinoBalance walletAddress totalDeposited totalWithdrawn lastActivity')
+        .lean();
+
+      if (!customer) {
+        return res.status(404).json({
+          success: false,
+          error: 'Customer not found'
+        });
       }
 
-      const searchRegex = new RegExp(q, 'i');
+      // Get REAL on-chain balance
+      const tokenService = new GambinoTokenService();
+      let onChainBalance = 0;
+      let solBalance = 0;
+      let blockchainError = null;
 
-      // Search across ALL user fields
-      const customers = await mongoose.models.User.find({
-        $or: [
-          { firstName: searchRegex },
-          { lastName: searchRegex },
-          { email: searchRegex },
-          { phone: searchRegex },
-          { username: searchRegex },
-          { walletAddress: searchRegex },
-          { 'wallet.address': searchRegex }
-        ],
-        role: { $nin: ['super_admin'] } // Exclude only super admins
+      if (customer.walletAddress) {
+        try {
+          const completeBalance = await tokenService.getUserCompleteBalance(customer.walletAddress);
+          if (completeBalance.success) {
+            onChainBalance = completeBalance.gambino.balance;
+            solBalance = completeBalance.sol.balance;
+          } else {
+            blockchainError = completeBalance.error;
+          }
+        } catch (err) {
+          console.error(`Failed to get blockchain balance for ${customer.walletAddress}:`, err.message);
+          blockchainError = err.message;
+        }
+      }
+
+      // Get recent transaction activity
+      const recentTransactions = await Transaction.find({
+        userId: customerId,
+        type: { $in: ['purchase', 'jackpot', 'cashout'] }
       })
-      .select('firstName lastName email phone username walletAddress wallet balance gambinoBalance cachedGambinoBalance lastActivity createdAt')
-      .limit(10)
-      .lean();
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean();
 
-      // Format results with full name and wallet info
-      const formattedCustomers = customers.map(c => ({
-        ...c,
-        fullName: `${c.firstName || ''} ${c.lastName || ''}`.trim() || c.username || c.email,
-        walletAddress: c.walletAddress || c.wallet?.address || 'No wallet',
-        balance: c.cachedGambinoBalance || c.gambinoBalance || c.balance || 0
-      }));
+      // Get today's cashouts
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
 
-      res.json({ 
-        customers: formattedCustomers,
-        count: formattedCustomers.length 
+      const todayCashouts = await Transaction.aggregate([
+        {
+          $match: {
+            userId: mongoose.Types.ObjectId(customerId),
+            type: 'cashout',
+            status: 'completed',
+            createdAt: { $gte: today, $lt: tomorrow }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            count: { $sum: 1 },
+            totalAmount: { $sum: '$usdAmount' }
+          }
+        }
+      ]);
+
+      res.json({
+        success: true,
+        customer: {
+          _id: customer._id,
+          fullName: `${customer.firstName} ${customer.lastName}`,
+          email: customer.email,
+          phone: customer.phone,
+          walletAddress: customer.walletAddress,
+          balance: onChainBalance, // REAL blockchain balance
+          balanceCached: customer.gambinoBalance || customer.cachedGambinoBalance || 0, // MongoDB cache
+          solBalance: solBalance, // SOL balance for gas fees
+          totalDeposited: customer.totalDeposited || 0,
+          totalWithdrawn: customer.totalWithdrawn || 0,
+          lastActivity: customer.lastActivity,
+          blockchainError
+        },
+        todayActivity: {
+          cashoutsCount: todayCashouts[0]?.count || 0,
+          cashoutsTotal: todayCashouts[0]?.totalAmount || 0
+        },
+        recentTransactions: recentTransactions.map(t => ({
+          type: t.type,
+          amount: t.amount,
+          usdAmount: t.usdAmount,
+          status: t.status,
+          blockchainTx: t.metadata?.blockchainTxSignature || t.txHash,
+          explorerUrl: t.metadata?.explorerUrl,
+          createdAt: t.createdAt
+        }))
       });
     } catch (error) {
-      console.error('Customer search error:', error);
-      res.status(500).json({ error: 'Search failed' });
+      console.error('Get customer balance error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to get customer balance'
+      });
     }
   }
 );
@@ -169,6 +269,26 @@ router.post(
         return res.status(400).json({
           success: false,
           error: 'tokensToConvert must be positive'
+        });
+      }
+
+      // KYC Check - user must be verified to cash out
+      const User = mongoose.model('User');
+      const customer = await User.findById(customerId).select('kycStatus firstName lastName');
+
+      if (!customer) {
+        return res.status(404).json({
+          success: false,
+          error: 'Customer not found'
+        });
+      }
+
+      if (customer.kycStatus !== 'verified') {
+        return res.status(403).json({
+          success: false,
+          error: 'KYC verification required',
+          kycRequired: true,
+          message: `${customer.firstName} ${customer.lastName} must complete KYC verification before cashing out. Please verify their ID first.`
         });
       }
 

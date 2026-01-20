@@ -233,6 +233,53 @@ router.post('/end-session', async (req, res) => {
       await escrow.deposit(finalReward);
     }
 
+    // === REFERRAL REWARD TRIGGER ===
+    // Check if this is user's first completed session - triggers referral rewards
+    try {
+      const completedSessions = await MiningSession.countDocuments({ 
+        userId, 
+        status: 'completed' 
+      });
+      
+      // First completed session triggers referral rewards for their referrer
+      if (completedSessions === 1) {
+        const Referral = require('../models/Referral');
+        const User = require('mongoose').model('User');
+        const { distributeReferralRewards } = require('../services/referralDistribution');
+        
+        // Find pending referral where this user is the referee
+        const referral = await Referral.findOne({
+          newUserId: userId,
+          status: 'pending'
+        });
+        
+        if (referral) {
+          console.log(`🎯 First session completed by referred user ${userId}, triggering referral reward`);
+          
+          // Mark as verified
+          await Referral.findByIdAndUpdate(referral._id, {
+            status: 'verified',
+            firstSessionAt: new Date(),
+            firstSessionDuration: session.duration
+          });
+          
+          // Get updated referral and distribute immediately
+          const updatedReferral = await Referral.findById(referral._id);
+          const distResult = await distributeReferralRewards(updatedReferral, User, Referral);
+          
+          if (distResult.success) {
+            console.log(`✅ Referral rewards distributed: referrer=${distResult.amounts.referrer} GG, newUser=${distResult.amounts.newUser} GG`);
+          } else {
+            console.log(`⚠️ Referral distribution deferred: ${distResult.reason}`);
+          }
+        }
+      }
+    } catch (refError) {
+      // Don't fail the session end if referral processing fails
+      console.error('Referral processing error (non-fatal):', refError.message);
+    }
+    // === END REFERRAL TRIGGER ===
+
     console.log(`✅ Mining session ended: ${sessionId}, reward: ${finalReward.toFixed(6)}, fraud: ${session.fraudScore}%`);
 
     res.json({

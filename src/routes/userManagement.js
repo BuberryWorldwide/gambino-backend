@@ -7,6 +7,9 @@ const router = express.Router();
 // Import middleware and models
 const { authenticate, requirePermission, PERMISSIONS } = require('../middleware/rbac');
 
+// Import Referral model
+const Referral = require('../models/Referral');
+
 // User management routes factory function
 const createUserManagementRoutes = (User, Session, Transfer, Transaction) => {
   
@@ -77,12 +80,14 @@ const createUserManagementRoutes = (User, Session, Transfer, Transaction) => {
   });
 
   // GET USER DETAILS
-  router.get('/:userId', authenticate, requirePermission(PERMISSIONS.MANAGE_USERS), async (req, res) => {
+  router.get('/:userId', authenticate, requirePermission([PERMISSIONS.VIEW_USERS, PERMISSIONS.MANAGE_USERS]), async (req, res) => {
     try {
       const { userId } = req.params;
 
       const user = await User.findById(userId)
         .select('-password -privateKey -privateKeyIV')
+        .populate('kycVerifiedBy', 'firstName lastName email')
+        .populate('ageVerifiedBy', 'firstName lastName email')
         .lean();
 
       if (!user) {
@@ -119,8 +124,6 @@ const createUserManagementRoutes = (User, Session, Transfer, Transaction) => {
   // CREATE NEW USER
   router.post('/create', authenticate, requirePermission(PERMISSIONS.MANAGE_USERS), async (req, res) => {
     try {
-      console.log('📝 Create user request body:', req.body);
-      
       const { 
         firstName, lastName, email, phone, password, 
         role = 'user', assignedVenues = [] 
@@ -169,9 +172,9 @@ const createUserManagementRoutes = (User, Session, Transfer, Transaction) => {
   router.put('/:userId', authenticate, requirePermission(PERMISSIONS.MANAGE_USERS), async (req, res) => {
     try {
       const { userId } = req.params;
-      const { firstName, lastName, email, phone, role, assignedVenues, isActive } = req.body;
+      const { firstName, lastName, email, phone, role, assignedVenues, isActive, isAgeVerified } = req.body;
 
-      console.log('📝 Update user request:', { userId, body: req.body });
+      console.log('📝 Update user request:', { userId, email: req.body.email, role: req.body.role });
 
       const user = await User.findById(userId);
       if (!user) {
@@ -187,11 +190,25 @@ const createUserManagementRoutes = (User, Session, Transfer, Transaction) => {
       if (assignedVenues !== undefined) updates.assignedVenues = assignedVenues;
       if (isActive !== undefined) updates.isActive = isActive;
 
+      // Handle age verification toggle
+      if (isAgeVerified !== undefined) {
+        updates.isAgeVerified = Boolean(isAgeVerified);
+        if (isAgeVerified && !user.isAgeVerified) {
+          // Newly verified - set timestamp and verifier
+          updates.ageVerifiedAt = new Date();
+          updates.ageVerifiedBy = req.user.userId || req.user._id;
+        } else if (!isAgeVerified) {
+          // Unverified - clear timestamp and verifier
+          updates.ageVerifiedAt = null;
+          updates.ageVerifiedBy = null;
+        }
+      }
+
       const updatedUser = await User.findByIdAndUpdate(
-        userId, 
-        updates, 
+        userId,
+        updates,
         { new: true, runValidators: true }
-      ).select('firstName lastName email role assignedVenues isActive');
+      ).select('firstName lastName email role assignedVenues isActive isAgeVerified ageVerifiedAt');
 
       console.log('✅ User updated:', updatedUser.email);
 
@@ -420,7 +437,7 @@ const createUserManagementRoutes = (User, Session, Transfer, Transaction) => {
         return res.status(400).json({ error: 'Valid email is required' });
       }
 
-      if (!['user', 'venue_staff', 'venue_manager', 'gambino_ops', 'super_admin'].includes(role)) {
+      if (!['user', 'venue_staff', 'venue_manager', 'operator', 'gambino_ops', 'super_admin'].includes(role)) {
         return res.status(400).json({ error: 'Invalid role specified' });
       }
 
@@ -464,6 +481,97 @@ const createUserManagementRoutes = (User, Session, Transfer, Transaction) => {
     } catch (error) {
       console.error('Invite user error:', error);
       res.status(500).json({ error: 'Failed to send invitation' });
+    }
+  });
+
+  // GET USER REFERRAL INFO
+  router.get('/:userId/referral', authenticate, requirePermission(PERMISSIONS.VIEW_USERS), async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      // Check if user was referred (as newUserId)
+      const referral = await Referral.findOne({ newUserId: userId })
+        .populate('referrerId', 'firstName lastName email walletAddress')
+        .lean();
+
+      // Check how many users this user has referred (as referrerId)
+      const referredUsers = await Referral.find({ referrerId: userId })
+        .populate('newUserId', 'firstName lastName email kycStatus createdAt')
+        .sort({ createdAt: -1 })
+        .lean();
+
+      res.json({
+        success: true,
+        referral: {
+          wasReferred: !!referral,
+          referredBy: referral ? {
+            _id: referral.referrerId?._id,
+            name: referral.referrerId ? `${referral.referrerId.firstName || ''} ${referral.referrerId.lastName || ''}`.trim() : null,
+            email: referral.referrerId?.email,
+            walletAddress: referral.referrerId?.walletAddress
+          } : null,
+          referralStatus: referral?.status,
+          referralSource: referral?.source,
+          referralCreatedAt: referral?.createdAt,
+          kycCompletedAt: referral?.kycCompletedAt,
+          hasReferred: referredUsers.length,
+          referredUsers: referredUsers.map(r => ({
+            _id: r.newUserId?._id,
+            name: r.newUserId ? `${r.newUserId.firstName || ''} ${r.newUserId.lastName || ''}`.trim() : null,
+            email: r.newUserId?.email,
+            kycStatus: r.newUserId?.kycStatus,
+            status: r.status,
+            createdAt: r.createdAt
+          }))
+        }
+      });
+
+    } catch (error) {
+      console.error('Get user referral error:', error);
+      res.status(500).json({ error: 'Failed to get referral info' });
+    }
+  });
+
+  // VERIFY USER AGE (toggle 18+ verification)
+  router.post('/:userId/verify-age', authenticate, requirePermission(PERMISSIONS.MANAGE_USERS), async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { verified } = req.body;
+
+      const user = await User.findById(userId);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      // Update age verification status
+      // Note: RBAC sets req.user.userId, not req.user._id
+      const verifierId = req.user.userId || req.user._id;
+      const updatedUser = await User.findByIdAndUpdate(
+        userId,
+        {
+          isAgeVerified: Boolean(verified),
+          ageVerifiedAt: verified ? new Date() : null,
+          ageVerifiedBy: verified ? verifierId : null
+        },
+        { new: true }
+      ).select('firstName lastName email isAgeVerified ageVerifiedAt');
+
+      console.log(`🔞 Age verification: ${user.email} is now ${verified ? 'verified' : 'unverified'} by ${req.user.email}`);
+
+      res.json({
+        success: true,
+        message: `Age ${verified ? 'verified' : 'unverified'} successfully`,
+        user: {
+          _id: updatedUser._id,
+          email: updatedUser.email,
+          isAgeVerified: updatedUser.isAgeVerified,
+          ageVerifiedAt: updatedUser.ageVerifiedAt
+        }
+      });
+
+    } catch (error) {
+      console.error('Verify age error:', error);
+      res.status(500).json({ error: 'Failed to verify age' });
     }
   });
 

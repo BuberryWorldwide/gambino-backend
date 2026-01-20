@@ -7,7 +7,8 @@ const { Keypair } = require("@solana/web3.js");
 class CredentialManager {
   constructor() {
     this.masterKey = this.getMasterKey();
-    this.vaultPath = "/opt/gambino/secure-vault";
+    // Use env var or fall back to local directory for development
+    this.vaultPath = process.env.VAULT_PATH || path.join(__dirname, '../../.secure-vault');
 
     this.credentialLevels = {
       jackpotReserve: "CRITICAL",
@@ -25,11 +26,8 @@ class CredentialManager {
     const masterKey = process.env.TREASURY_MASTER_KEY;
 
     if (!masterKey) {
-      console.warn("⚠️  No TREASURY_MASTER_KEY found - generating temporary key");
-      const tempKey = crypto.randomBytes(32).toString("hex");
-      console.log(`🔑 Temporary Master Key: ${tempKey}`);
-      console.log("⚠️  Add this to your .env file: TREASURY_MASTER_KEY=" + tempKey);
-      return tempKey;
+      console.error("❌ FATAL: TREASURY_MASTER_KEY not set in environment");
+      throw new Error("TREASURY_MASTER_KEY is required");
     }
 
     return masterKey;

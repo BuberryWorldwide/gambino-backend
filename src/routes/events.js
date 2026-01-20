@@ -283,3 +283,94 @@ router.get('/today/summary',
 );
 
 module.exports = router;
+/**
+ * GET /api/admin/events/books-cleared
+ * Get the latest books_cleared event for each machine (for machines table)
+ */
+router.get("/books-cleared",
+  authenticate,
+  requirePermission(PERMISSIONS.VIEW_MACHINES),
+  async (req, res) => {
+    try {
+      const { storeId } = req.query;
+      
+      // Build match query - optionally filter by storeId
+      const matchQuery = { eventType: "books_cleared" };
+      if (storeId) {
+        matchQuery.storeId = storeId;
+      }
+
+      // Get the latest books_cleared event per machine using aggregation
+      const latestCleared = await Event.aggregate([
+        { $match: matchQuery },
+        { $sort: { timestamp: -1 } },
+        {
+          $group: {
+            _id: "$machineId",
+            lastCleared: { $first: "$timestamp" },
+            clearCount: { $first: "$metadata.clearCount" },
+            lastClearedDate: { $first: "$metadata.lastClearedDate" },
+            lastClearedTime: { $first: "$metadata.lastClearedTime" },
+            storeId: { $first: "$storeId" },
+            hubId: { $first: "$hubId" },
+            rawData: { $first: "$rawData" }
+          }
+        },
+        {
+          $project: {
+            machineId: "$_id",
+            lastCleared: 1,
+            clearCount: 1,
+            lastClearedDate: 1,
+            lastClearedTime: 1,
+            storeId: 1,
+            hubId: 1,
+            rawData: 1,
+            _id: 0,
+            // Calculate days since last cleared
+            daysSinceCleared: {
+              $divide: [
+                { $subtract: [new Date(), "$lastCleared"] },
+                1000 * 60 * 60 * 24
+              ]
+            }
+          }
+        }
+      ]);
+
+      // Create a map for easy lookup
+      const clearedMap = {};
+      latestCleared.forEach(item => {
+        clearedMap[item.machineId] = {
+          lastCleared: item.lastCleared,
+          clearCount: item.clearCount,
+          lastClearedDate: item.lastClearedDate,
+          lastClearedTime: item.lastClearedTime,
+          daysSinceCleared: Math.floor(item.daysSinceCleared || 0),
+          status: getBooksClearedStatus(item.daysSinceCleared)
+        };
+      });
+
+      res.json({
+        success: true,
+        data: clearedMap,
+        count: latestCleared.length
+      });
+
+    } catch (error) {
+      console.error("Error fetching books cleared data:", error);
+      res.status(500).json({
+        success: false,
+        error: "Failed to fetch books cleared data"
+      });
+    }
+  }
+);
+
+// Helper function to determine status based on days since cleared
+function getBooksClearedStatus(daysSinceCleared) {
+  if (daysSinceCleared === null || daysSinceCleared === undefined) return "unknown";
+  if (daysSinceCleared <= 3) return "recent";
+  if (daysSinceCleared <= 7) return "warning";
+  return "overdue";
+}

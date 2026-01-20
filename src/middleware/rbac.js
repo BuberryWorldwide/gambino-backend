@@ -43,6 +43,13 @@ const PERMISSIONS = {
   // System Operations
   SYSTEM_ADMIN: 'system_admin',
   VIEW_PROFILE: 'view_profile',
+
+  // KYC Operations
+  KYC_VERIFY: 'kyc_verify',
+  KYC_VIEW_PENDING: 'kyc_view_pending',
+  KYC_VIEW_HISTORY: 'kyc_view_history',
+  KYC_REJECT: 'kyc_reject',
+  KYC_MANAGE: 'kyc_manage',  // Compliance management (super_admin only)
 };
 
 // Map roles to their permissions
@@ -69,10 +76,16 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_VENUES,
     PERMISSIONS.SYSTEM_ADMIN,
     PERMISSIONS.VIEW_PROFILE,
+    PERMISSIONS.KYC_VERIFY,
+    PERMISSIONS.KYC_VIEW_PENDING,
+    PERMISSIONS.KYC_VIEW_HISTORY,
+    PERMISSIONS.KYC_REJECT,
+    PERMISSIONS.KYC_MANAGE,
   ],
-  
+
   gambino_ops: [
     PERMISSIONS.VIEW_USERS,
+    PERMISSIONS.MANAGE_USERS,
     PERMISSIONS.VIEW_ALL_STORES,
     PERMISSIONS.MANAGE_ALL_STORES,
     PERMISSIONS.CREATE_STORES,
@@ -89,8 +102,12 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.MANAGE_MACHINES,
     PERMISSIONS.VIEW_VENUES,
     PERMISSIONS.VIEW_PROFILE,
+    PERMISSIONS.KYC_VERIFY,
+    PERMISSIONS.KYC_VIEW_PENDING,
+    PERMISSIONS.KYC_VIEW_HISTORY,
+    PERMISSIONS.KYC_REJECT,
   ],
-  
+
   venue_manager: [
     PERMISSIONS.VIEW_ASSIGNED_STORES,
     PERMISSIONS.MANAGE_ASSIGNED_STORES,
@@ -104,8 +121,12 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_MACHINES,
     PERMISSIONS.VIEW_VENUES,
     PERMISSIONS.VIEW_PROFILE,
+    PERMISSIONS.KYC_VERIFY,
+    PERMISSIONS.KYC_VIEW_PENDING,
+    PERMISSIONS.KYC_VIEW_HISTORY,
+    PERMISSIONS.KYC_REJECT,
   ],
-  
+
   venue_staff: [
     PERMISSIONS.VIEW_ASSIGNED_STORES,
     PERMISSIONS.VIEW_STORE_METRICS,
@@ -114,8 +135,22 @@ const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_MACHINES,
     PERMISSIONS.VIEW_VENUES,
     PERMISSIONS.VIEW_PROFILE,
+    PERMISSIONS.KYC_VERIFY,
+    PERMISSIONS.KYC_VIEW_PENDING,
   ],
-  
+
+  operator: [
+    PERMISSIONS.VIEW_ASSIGNED_STORES,
+    PERMISSIONS.MANAGE_ASSIGNED_STORES,
+    PERMISSIONS.VIEW_STORE_METRICS,
+    PERMISSIONS.SUBMIT_REPORTS,
+    PERMISSIONS.VIEW_STORE_WALLETS,
+    PERMISSIONS.VIEW_CASHOUT_HISTORY,
+    PERMISSIONS.VIEW_MACHINES,
+    PERMISSIONS.VIEW_VENUES,
+    PERMISSIONS.VIEW_PROFILE,
+  ],
+
   user: [
     PERMISSIONS.VIEW_PROFILE,
   ],
@@ -164,12 +199,12 @@ function checkVenueAccess(userRole, assignedVenues = [], storeId) {
     };
   }
   
-  // Venue staff and managers need to be assigned to the venue
-  if (['venue_staff', 'venue_manager'].includes(userRole)) {
+  // Venue staff, operators and managers need to be assigned to the venue
+  if (['venue_staff', 'venue_manager', 'operator'].includes(userRole)) {
     const hasAccess = assignedVenues.includes(storeId);
     return {
       hasAccess,
-      canManage: userRole === 'venue_manager' && hasAccess,
+      canManage: ['venue_manager', 'operator'].includes(userRole) && hasAccess,
       accessType: hasAccess ? 'venue_assigned' : 'denied',
       reason: hasAccess ? 'venue_assignment' : 'not_assigned'
     };
@@ -421,23 +456,111 @@ const requireVenueAccess = (options = {}) => {
 };
 
 /**
+ * SECURITY: Verify user role from database (not JWT)
+ * This prevents role escalation attacks where JWT role differs from DB role
+ *
+ * Critical for:
+ * - Treasury/financial operations
+ * - User management
+ * - Role assignments
+ * - Token distributions
+ *
+ * @param {Object} options - Configuration options
+ */
+const verifyRoleFromDatabase = async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        code: 'NOT_AUTHENTICATED'
+      });
+    }
+
+    // Get User model (check if already compiled to avoid Mongoose error)
+    const mongoose = require('mongoose');
+    const User = mongoose.models.User || require('../models/User');
+
+    const user = await User.findById(req.user.userId)
+      .select('role isActive assignedVenues tokenVersion')
+      .lean();
+
+    if (!user) {
+      console.warn(`🚫 User not found in DB but has valid JWT: ${req.user.userId}`);
+      return res.status(401).json({
+        error: 'User account not found',
+        code: 'USER_NOT_FOUND'
+      });
+    }
+
+    if (!user.isActive) {
+      console.warn(`🚫 Inactive user attempted access: ${req.user.userId}`);
+      return res.status(403).json({
+        error: 'Account has been deactivated',
+        code: 'ACCOUNT_INACTIVE'
+      });
+    }
+
+    // CRITICAL: Check if role in JWT matches role in database
+    if (req.user.role !== user.role) {
+      console.warn(`⚠️ SECURITY: Role mismatch detected for user ${req.user.userId}:`, {
+        jwtRole: req.user.role,
+        dbRole: user.role,
+        endpoint: req.originalUrl,
+        ip: req.ip
+      });
+
+      // Update role from database (source of truth)
+      req.user.role = user.role;
+      req.user.roleVerified = true;
+    }
+
+    // Check token version (for emergency session revocation)
+    if (user.tokenVersion !== undefined && req.user.tokenVersion !== undefined) {
+      if (user.tokenVersion !== req.user.tokenVersion) {
+        console.warn(`🚫 Token version mismatch for user ${req.user.userId}:`, {
+          jwtVersion: req.user.tokenVersion,
+          dbVersion: user.tokenVersion
+        });
+        return res.status(401).json({
+          error: 'Session has been revoked by administrator',
+          code: 'TOKEN_VERSION_MISMATCH'
+        });
+      }
+    }
+
+    // Update assigned venues from database (source of truth)
+    req.user.assignedVenues = user.assignedVenues || [];
+
+    console.log(`✅ Role verified from DB for user ${req.user.userId}: ${user.role}`);
+
+    next();
+  } catch (error) {
+    console.error('❌ Role verification error:', error);
+    return res.status(500).json({
+      error: 'Authorization verification failed',
+      code: 'ROLE_VERIFICATION_ERROR'
+    });
+  }
+};
+
+/**
  * Legacy role-based middleware (for backward compatibility)
  * @param {Array} allowedRoles - Array of allowed roles
  * @deprecated Use requirePermission instead
  */
 const requireRole = (allowedRoles) => {
   console.warn('requireRole is deprecated. Use requirePermission instead.');
-  
+
   return (req, res, next) => {
     if (!req.user) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'Authentication required',
         code: 'NOT_AUTHENTICATED'
       });
     }
 
     const userRole = req.user.role;
-    
+
     if (!allowedRoles.includes(userRole)) {
       return res.status(403).json({
         error: 'Insufficient permissions',
@@ -446,7 +569,7 @@ const requireRole = (allowedRoles) => {
         current: userRole
       });
     }
-    
+
     next();
   };
 };
@@ -472,6 +595,7 @@ module.exports = {
   authenticate,
   requirePermission,
   requireVenueAccess,
+  verifyRoleFromDatabase, // SECURITY: Verify role from DB, not JWT
   requireRole, // deprecated
   createVenueMiddleware,
 };

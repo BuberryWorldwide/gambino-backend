@@ -5,8 +5,12 @@ class DailyReportProcessor {
   
   async processDailySummaryEvents(storeId, hubId, timestamp) {
     try {
-      const reportDate = new Date(timestamp);
-      reportDate.setHours(0, 0, 0, 0);
+      // Convert timestamp to EST business day
+      const eventTime = new Date(timestamp);
+      const estDateStr = eventTime.toLocaleDateString("en-US", { timeZone: "America/New_York" });
+      const [month, day, year] = estDateStr.split("/");
+      const reportDate = new Date(Date.UTC(parseInt(year), parseInt(month) - 1, parseInt(day), 5, 0, 0));
+      console.log("Event time: " + eventTime.toISOString() + ", EST business day: " + estDateStr);
       
       const batchStartTime = new Date(timestamp);
       batchStartTime.setSeconds(batchStartTime.getSeconds() - 60);
@@ -129,19 +133,8 @@ class DailyReportProcessor {
         netRevenue: machine.moneyIn - machine.collect
       }));
 
-      // Filter out grand_total from machine list for per-machine breakdown
-      const machinesOnly = machineData.filter(m => m.machineId !== 'grand_total');
-      const grandTotalEntry = machineData.find(m => m.machineId === 'grand_total');
-
-      // Use grand_total for store totals if available, otherwise sum machines
-      let totalMoneyIn, totalMoneyOut;
-      if (grandTotalEntry) {
-        totalMoneyIn = grandTotalEntry.moneyIn;
-        totalMoneyOut = grandTotalEntry.collect;
-      } else {
-        totalMoneyIn = machinesOnly.reduce((sum, m) => sum + m.moneyIn, 0);
-        totalMoneyOut = machinesOnly.reduce((sum, m) => sum + m.collect, 0);
-      }
+      const totalMoneyIn = machineData.reduce((sum, m) => sum + m.moneyIn, 0);
+      const totalMoneyOut = machineData.reduce((sum, m) => sum + m.collect, 0);
 
       // Create NEW DailyReport record
       const report = await DailyReport.create({
@@ -152,8 +145,8 @@ class DailyReportProcessor {
         totalRevenue: totalMoneyIn - totalMoneyOut,
         totalMoneyIn,
         totalCollect: totalMoneyOut,
-        machineData: machinesOnly,  // Exclude grand_total from machine breakdown
-        machineCount: machinesOnly.length,
+        machineData,
+        machineCount: Object.keys(machineGroups).length,
         reconciliationStatus: 'pending',
         qualityScore: this.calculateQualityScore(events, machineData),
         hasAnomalies: false,

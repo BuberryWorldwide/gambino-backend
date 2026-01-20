@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 
 const machineSchema = new mongoose.Schema({
   machineId: { type: String, required: true, unique: true },
+  originalMachineId: { type: String }, // Preserves the MuthaGoose ID (e.g., machine_01) before composite ID
   storeId: { type: String, required: true },
   name: { type: String }, // Display name like "Lucky Slots #1"
   location: String, // Physical location within store "Near entrance"
@@ -10,6 +11,19 @@ const machineSchema = new mongoose.Schema({
   qrCode: { type: String }, // Base64 QR code image
   qrToken: { type: String }, // The binding token
   qrGeneratedAt: { type: Date },
+  // VDV Asset Tag
+  assetTag: { type: String, sparse: true, index: true },
+  gameTitle: { type: String }, // Game title e.g. Buffalo Gold
+  physicalStatus: { type: String, enum: ['deployed', 'storage', 'repair', 'decommissioned'], default: 'storage' },
+  displayName: { type: String },
+  manufacturer: { type: String },
+  machineModel: { type: String },
+  serialNumber: { type: String },
+  inventoryNotes: { type: String },
+  credentials: {
+    lockPin: { type: String },
+    attendantPin: { type: String }
+  },
   gameType: { 
     type: String, 
     enum: ['slot', 'poker', 'blackjack', 'roulette', 'edge', 'other'], 
@@ -270,7 +284,7 @@ machineSchema.statics.getUnmappedMuthaGooseActivity = function(storeId, hoursBac
 };
 
 // Virtual for display name
-machineSchema.virtual('displayName').get(function() {
+machineSchema.virtual('displayLabel').get(function() {
   return this.name || `Machine ${this.machineId}`;
 });
 
@@ -293,10 +307,42 @@ machineSchema.virtual('muthaGooseDisplayName').get(function() {
   return null;
 });
 
-// Pre-save middleware to update timestamps
+// Pre-save middleware to update timestamps and generate composite IDs
 machineSchema.pre('save', function(next) {
   this.updatedAt = new Date();
+  
+  // Auto-generate composite machineId for new machines with hubId
+  if (this.isNew && this.hubId && this.machineId) {
+    // If machineId doesn't already include hubId, make it composite
+    if (!this.machineId.includes(this.hubId)) {
+      // Preserve original if not already saved
+      if (!this.originalMachineId) {
+        this.originalMachineId = this.machineId;
+      }
+      this.machineId = `${this.hubId}_${this.machineId}`;
+      console.log(`Generated composite machineId: ${this.machineId}`);
+    }
+  }
+  
   next();
 });
 
+
+// Helper to generate composite machine ID from hubId and MuthaGoose ID
+machineSchema.statics.generateCompositeId = function(hubId, muthaGooseId) {
+  if (!hubId || !muthaGooseId) return muthaGooseId;
+  // If already composite, return as-is
+  if (muthaGooseId.includes(hubId)) return muthaGooseId;
+  return `${hubId}_${muthaGooseId}`;
+};
+
+// Helper to extract original MuthaGoose ID from composite ID
+machineSchema.statics.extractOriginalId = function(compositeId, hubId) {
+  if (!hubId || !compositeId) return compositeId;
+  const prefix = `${hubId}_`;
+  if (compositeId.startsWith(prefix)) {
+    return compositeId.substring(prefix.length);
+  }
+  return compositeId;
+};
 module.exports = mongoose.model('Machine', machineSchema);

@@ -349,3 +349,145 @@ module.exports = {
   setupMiddleware,
   setupModels
 };
+// Import BookkeepingReport model (lazy loaded)
+let BookkeepingReport;
+function getBookkeepingReport() {
+  if (!BookkeepingReport) {
+    BookkeepingReport = require('../models/BookkeepingReport');
+  }
+  return BookkeepingReport;
+}
+
+/**
+ * GET /api/admin/reports/:storeId/bookkeeping
+ * Get bookkeeping and clearing reports for a store
+ * Query params: startDate, endDate (optional), reportType (optional: 'bookkeeping' | 'clearing' | 'all')
+ */
+router.get('/:storeId/bookkeeping',
+  authenticate,
+  requirePermission('view_store_metrics'),
+  ...createVenueMiddleware({ requireManagement: false, action: 'view_bookkeeping' }),
+  async (req, res) => {
+    try {
+      const { storeId } = req.params;
+      const { startDate, endDate, reportType, limit } = req.query;
+
+      console.log(`📚 Fetching bookkeeping reports for ${storeId}`);
+
+      const BookkeepingReportModel = getBookkeepingReport();
+      const query = { storeId };
+
+      // Filter by report type
+      if (reportType && reportType !== 'all') {
+        query.reportType = reportType;
+      }
+
+      // Filter by date range
+      if (startDate || endDate) {
+        query.timestamp = {};
+        if (startDate) {
+          const start = new Date(startDate);
+          start.setHours(0, 0, 0, 0);
+          query.timestamp.$gte = start;
+        }
+        if (endDate) {
+          const end = new Date(endDate);
+          end.setHours(23, 59, 59, 999);
+          query.timestamp.$lte = end;
+        }
+      }
+
+      const reports = await BookkeepingReportModel
+        .find(query)
+        .sort({ timestamp: -1 })
+        .limit(parseInt(limit) || 100);
+
+      // Get summary stats
+      const totalClears = await BookkeepingReportModel.countDocuments({ 
+        storeId, 
+        reportType: 'clearing' 
+      });
+      
+      const lastClear = await BookkeepingReportModel.findOne({ 
+        storeId, 
+        reportType: 'clearing' 
+      }).sort({ timestamp: -1 });
+
+      console.log(`✅ Found ${reports.length} bookkeeping reports for ${storeId}`);
+
+      res.json({
+        success: true,
+        reports,
+        summary: {
+          totalReports: reports.length,
+          totalClears,
+          lastClearTimestamp: lastClear?.timestamp || null,
+          lastClearValues: lastClear?.clearedValues || null
+        }
+      });
+
+    } catch (error) {
+      console.error('❌ Error fetching bookkeeping reports:', error);
+      res.status(500).json({ 
+        error: 'Failed to fetch bookkeeping reports',
+        message: error.message 
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/admin/reports/:storeId/bookkeeping/latest
+ * Get the latest bookkeeping and clearing info
+ */
+router.get('/:storeId/bookkeeping/latest',
+  authenticate,
+  requirePermission('view_store_metrics'),
+  ...createVenueMiddleware({ requireManagement: false, action: 'view_bookkeeping' }),
+  async (req, res) => {
+    try {
+      const { storeId } = req.params;
+
+      const BookkeepingReportModel = getBookkeepingReport();
+
+      // Get latest bookkeeping report
+      const latestBookkeeping = await BookkeepingReportModel.findOne({ 
+        storeId, 
+        reportType: 'bookkeeping' 
+      }).sort({ timestamp: -1 });
+
+      // Get latest clearing
+      const latestClearing = await BookkeepingReportModel.findOne({ 
+        storeId, 
+        reportType: 'clearing' 
+      }).sort({ timestamp: -1 });
+
+      // Get count since last clear
+      let reportsSinceLastClear = 0;
+      if (latestClearing) {
+        reportsSinceLastClear = await BookkeepingReportModel.countDocuments({
+          storeId,
+          reportType: 'bookkeeping',
+          timestamp: { $gt: latestClearing.timestamp }
+        });
+      }
+
+      res.json({
+        success: true,
+        latestBookkeeping,
+        latestClearing,
+        reportsSinceLastClear
+      });
+
+    } catch (error) {
+      console.error('❌ Error fetching latest bookkeeping:', error);
+      res.status(500).json({ 
+        error: 'Failed to fetch latest bookkeeping',
+        message: error.message 
+      });
+    }
+  }
+);
+
+
+module.exports = { router, setupMiddleware, setupModels };

@@ -200,39 +200,22 @@ router.get('/:hubId',
       });
 
       // Get machine details with revenue stats
-      // FIX: Get the LAST event per day per machine, then sum across days
-      // This avoids double-counting cumulative snapshots
       const machineStats = await Event.aggregate([
         {
           $match: {
             hubMachineId: hub.hubId,
             storeId: hub.storeId,
-            gamingMachineId: { $in: machineIds },
-            eventType: { $in: ['money_in', 'money_out'] }
+            gamingMachineId: { $in: machineIds }
           }
         },
-        // Sort by timestamp descending to get latest first within each day
-        { $sort: { timestamp: -1 } },
-        // Group by machine + day + eventType, taking the first (latest) amount
         {
           $group: {
-            _id: {
-              machineId: '$gamingMachineId',
-              day: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp' } },
-              eventType: '$eventType'
+            _id: '$gamingMachineId',
+            moneyIn: { 
+              $sum: { $cond: [{ $eq: ['$eventType', 'money_in'] }, '$amount', 0] }
             },
-            amount: { $first: '$amount' }
-          }
-        },
-        // Now sum by machine, separating moneyIn and moneyOut
-        {
-          $group: {
-            _id: '$_id.machineId',
-            moneyIn: {
-              $sum: { $cond: [{ $eq: ['$_id.eventType', 'money_in'] }, '$amount', 0] }
-            },
-            moneyOut: {
-              $sum: { $cond: [{ $eq: ['$_id.eventType', 'money_out'] }, '$amount', 0] }
+            moneyOut: { 
+              $sum: { $cond: [{ $eq: ['$eventType', 'money_out'] }, '$amount', 0] }
             }
           }
         }
@@ -291,25 +274,12 @@ router.post('/register',
   requirePermission([PERMISSIONS.MANAGE_ALL_STORES]),
   async (req, res) => {
     try {
-      let { hubId, name, storeId, serialPort } = req.body;
+      const { hubId, name, storeId, serialPort } = req.body;
       
-      if (!name || !storeId) {
+      if (!hubId || !name || !storeId) {
         return res.status(400).json({ 
-          error: 'name and storeId are required' 
+          error: 'hubId, name, and storeId are required' 
         });
-      }
-      
-      // Auto-generate hub ID if not provided
-      if (!hubId) {
-        // Find the highest existing pi-XXX number
-        const existingHubs = await Hub.find({ hubId: /^pi-\d{3}$/ }).sort({ hubId: -1 }).limit(1);
-        let nextNum = 1;
-        if (existingHubs.length > 0) {
-          const lastNum = parseInt(existingHubs[0].hubId.replace('pi-', ''));
-          nextNum = lastNum + 1;
-        }
-        hubId = 'pi-' + String(nextNum).padStart(3, '0');
-        console.log('Auto-generated hub ID:', hubId);
       }
       
       // Check if hub already exists
@@ -763,24 +733,20 @@ router.get('/:hubId/discovered-machines',
         : new Date(endDate.getTime() - (30 * 24 * 60 * 60 * 1000)); // 30 days ago
       startDate.setHours(0, 0, 0, 0);
       
-      const distinctMachineIds = (await Event.distinct('gamingMachineId', { 
+      const distinctMachineIds = await Event.distinct('gamingMachineId', { 
         hubMachineId: hubId,
         storeId: hub.storeId,
-        gamingMachineId: { $ne: hubId, $not: /unknown|grand_total/i }
-      })).filter(id => id && !id.includes('unknown') && !id.includes('grand_total'));
+        gamingMachineId: { $ne: hubId }
+      });
       
             const machines = await Promise.all(distinctMachineIds.map(async (machineId) => {
         const machineRecord = await Machine.findOne({ 
-          $or: [
-            { machineId, storeId: hub.storeId },
-            { machineId: `${hubId}_${machineId}`, storeId: hub.storeId }
-          ]
+          machineId,
+          storeId: hub.storeId 
         }).lean();
         
         const DailyReport = require('../models/DailyReport');
-
-        // FIX: Get the LAST report per day (highest createdAt), then sum across days
-        // This avoids double-counting cumulative snapshots within the same day
+        
         const reports = await DailyReport.aggregate([
           {
             $match: {
@@ -794,22 +760,11 @@ router.get('/:hubId/discovered-machines',
               'machineData.machineId': machineId
             }
           },
-          // Sort by reportDate and createdAt descending to get latest per day first
-          { $sort: { reportDate: 1, createdAt: -1 } },
-          // Group by day, taking the FIRST (latest due to sort) values
-          {
-            $group: {
-              _id: { $dateToString: { format: '%Y-%m-%d', date: '$reportDate' } },
-              moneyIn: { $first: '$machineData.moneyIn' },
-              moneyOut: { $first: '$machineData.collect' }
-            }
-          },
-          // Now sum the daily values across all days
           {
             $group: {
               _id: null,
-              totalMoneyIn: { $sum: '$moneyIn' },
-              totalMoneyOut: { $sum: '$moneyOut' }
+              totalMoneyIn: { $sum: '$machineData.moneyIn' },
+              totalMoneyOut: { $sum: '$machineData.collect' }
             }
           }
         ]);
@@ -1298,179 +1253,3 @@ router.post('/admin/hubs/cleanup-tokens',
 );
 
 module.exports = router;
-// ============================================================================
-// ANALYTICS ENDPOINTS
-// ============================================================================
-
-// GET /api/admin/hubs/:hubId/analytics/daily - Daily revenue trend
-router.get('/:hubId/analytics/daily',
-  authenticate,
-  requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]),
-  async (req, res) => {
-    try {
-      const { hubId } = req.params;
-      const days = parseInt(req.query.days) || 14;
-      
-      const hub = await Hub.findOne({ hubId });
-      if (!hub) return res.status(404).json({ error: 'Hub not found' });
-      
-      const startDate = new Date();
-      startDate.setDate(startDate.getDate() - days);
-      startDate.setHours(0, 0, 0, 0);
-      
-      const dailyStats = await Event.aggregate([
-        {
-          $match: {
-            hubMachineId: hubId,
-            storeId: hub.storeId,
-            timestamp: { $gte: startDate }
-          }
-        },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp' } },
-            moneyIn: { $sum: { $cond: [{ $eq: ['$eventType', 'money_in'] }, '$amount', 0] } },
-            moneyOut: { $sum: { $cond: [{ $eq: ['$eventType', 'money_out'] }, '$amount', 0] } },
-            eventCount: { $sum: 1 }
-          }
-        },
-        { $sort: { _id: 1 } }
-      ]);
-      
-      res.json({
-        success: true,
-        hubId,
-        days,
-        data: dailyStats.map(d => ({
-          date: d._id,
-          moneyIn: d.moneyIn,
-          moneyOut: d.moneyOut,
-          net: d.moneyIn - d.moneyOut,
-          events: d.eventCount
-        }))
-      });
-    } catch (error) {
-      console.error('Daily analytics error:', error);
-      res.status(500).json({ error: 'Failed to load daily analytics' });
-    }
-  }
-);
-
-// GET /api/admin/hubs/:hubId/analytics/hourly - Hourly activity pattern
-router.get('/:hubId/analytics/hourly',
-  authenticate,
-  requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]),
-  async (req, res) => {
-    try {
-      const { hubId } = req.params;
-      const days = parseInt(req.query.days) || 7;
-      
-      const hub = await Hub.findOne({ hubId });
-      if (!hub) return res.status(404).json({ error: 'Hub not found' });
-      
-      const startDate = new Date();
-      startDate.setDate(startDate.getDate() - days);
-      
-      const hourlyStats = await Event.aggregate([
-        {
-          $match: {
-            hubMachineId: hubId,
-            storeId: hub.storeId,
-            timestamp: { $gte: startDate }
-          }
-        },
-        {
-          $group: {
-            _id: { $hour: '$timestamp' },
-            moneyIn: { $sum: { $cond: [{ $eq: ['$eventType', 'money_in'] }, '$amount', 0] } },
-            moneyOut: { $sum: { $cond: [{ $eq: ['$eventType', 'money_out'] }, '$amount', 0] } },
-            eventCount: { $sum: 1 }
-          }
-        },
-        { $sort: { _id: 1 } }
-      ]);
-      
-      res.json({
-        success: true,
-        hubId,
-        days,
-        data: hourlyStats.map(h => {
-          const hr = h._id;
-          const label = hr === 0 ? '12AM' : hr < 12 ? hr + 'AM' : hr === 12 ? '12PM' : (hr - 12) + 'PM';
-          return {
-            hour: hr,
-            label,
-            moneyIn: h.moneyIn,
-            moneyOut: h.moneyOut,
-            events: h.eventCount
-          };
-        })
-      });
-    } catch (error) {
-      console.error('Hourly analytics error:', error);
-      res.status(500).json({ error: 'Failed to load hourly analytics' });
-    }
-  }
-);
-
-// GET /api/admin/hubs/:hubId/analytics/machines - Machine breakdown
-router.get('/:hubId/analytics/machines',
-  authenticate,
-  requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]),
-  async (req, res) => {
-    try {
-      const { hubId } = req.params;
-      const days = parseInt(req.query.days) || 30;
-      
-      const hub = await Hub.findOne({ hubId });
-      if (!hub) return res.status(404).json({ error: 'Hub not found' });
-      
-      const startDate = new Date();
-      startDate.setDate(startDate.getDate() - days);
-      
-      const machineStats = await Event.aggregate([
-        {
-          $match: {
-            hubMachineId: hubId,
-            storeId: hub.storeId,
-            timestamp: { $gte: startDate },
-            gamingMachineId: { $ne: hubId, $not: /unknown|grand_total/i }
-          }
-        },
-        {
-          $group: {
-            _id: '$gamingMachineId',
-            moneyIn: { $sum: { $cond: [{ $eq: ['$eventType', 'money_in'] }, '$amount', 0] } },
-            moneyOut: { $sum: { $cond: [{ $eq: ['$eventType', 'money_out'] }, '$amount', 0] } },
-            eventCount: { $sum: 1 }
-          }
-        },
-        { $sort: { moneyIn: -1 } },
-        { $limit: 20 }
-      ]);
-      
-      // Get machine names
-      const machineIds = machineStats.map(m => m._id);
-      const machines = await Machine.find({ machineId: { $in: machineIds } }).select('machineId name').lean();
-      const nameMap = {};
-      machines.forEach(m => { nameMap[m.machineId] = m.name; });
-      
-      res.json({
-        success: true,
-        hubId,
-        days,
-        data: machineStats.map(m => ({
-          machineId: m._id,
-          name: nameMap[m._id] || m._id,
-          moneyIn: m.moneyIn,
-          moneyOut: m.moneyOut,
-          netRevenue: m.moneyIn - m.moneyOut,
-          events: m.eventCount
-        }))
-      });
-    } catch (error) {
-      console.error('Machine analytics error:', error);
-      res.status(500).json({ error: 'Failed to load machine analytics' });
-    }
-  }
-);

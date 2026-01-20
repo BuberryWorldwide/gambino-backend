@@ -6,7 +6,7 @@ const eventSchema = new mongoose.Schema({
   eventType: {
     type: String,
     required: true,
-    enum: ['voucher', 'voucher_print', 'money_in', 'collect', 'session_start', 'session_end', 'test', 'daily_summary', 'money_out']
+    enum: ['voucher', 'voucher_print', 'money_in', 'collect', 'session_start', 'session_end', 'test', 'daily_summary', 'money_out', 'books_cleared', 'books_clearing']
   },
   
   // Machine identification

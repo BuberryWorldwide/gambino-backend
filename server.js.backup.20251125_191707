@@ -1,0 +1,2014 @@
+/*
+ * RBAC MIGRATION COMPLETED - 2025-09-09T07:52:00.088Z
+ * 
+ * This file has been automatically migrated to use the new RBAC system.
+ * 
+ * CHANGES MADE:
+ * - Added RBAC imports
+ * - Removed 7 old middleware definitions
+ * - Replaced 2 login endpoints with unified auth
+ * - Converted 27 routes to RBAC
+ * - Updated 0 request object references
+ *
+ * WARNINGS:
+ * None
+ *
+ * TODO - Manual Review Required:
+ * 1. Test all endpoints with different user roles
+ * 2. Verify permission mappings are correct
+ * 3. Check venue access restrictions
+ * 4. Update any custom middleware not covered by this script
+ * 5. Remove this comment block after review
+ */
+
+require('dotenv').config();
+
+// Add at top of server.js
+const winston = require('winston');
+
+
+
+const securityLogger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({
+      filename: './logs/security.log',
+      maxsize: 10485760, // 10MB
+      maxFiles: 10
+    }),
+    new winston.transports.Console({
+      format: winston.format.simple(),
+      level: 'warn'
+    })
+  ]
+});
+
+// Helper function
+function logSecurityEvent(type, req, data = {}) {
+  securityLogger.info({
+    type,
+    ip: req.ip,
+    userAgent: req.get('user-agent'),
+    user: req.user?.userId,
+    email: req.user?.email,
+    path: req.path,
+    ...data
+  });
+}
+
+
+// ============================================================
+// CRITICAL SECURITY: Validate required environment variables
+// ============================================================
+console.log('🔒 Validating security configuration...');
+
+const REQUIRED_SECRETS = [
+  'JWT_SECRET',
+  'WALLET_ENCRYPTION_KEY', 
+  'MONGODB_URI'
+];
+
+REQUIRED_SECRETS.forEach(key => {
+  if (!process.env[key]) {
+    console.error(`❌ FATAL: ${key} not set in environment`);
+    process.exit(1);
+  }
+  if (process.env[key].length < 32) {
+    console.error(`❌ FATAL: ${key} too short (must be 32+ chars)`);
+    process.exit(1);
+  }
+});
+
+// Validate WALLET_ENCRYPTION_KEY is valid hex
+try {
+  const encKey = Buffer.from(process.env.WALLET_ENCRYPTION_KEY, 'hex');
+  if (encKey.length !== 32) {
+    throw new Error('Must be 64 hex chars');
+  }
+} catch (e) {
+  console.error(`❌ FATAL: WALLET_ENCRYPTION_KEY invalid - ${e.message}`);
+  process.exit(1);
+}
+
+console.log('✅ Security configuration validated\n');
+
+const express = require('express');
+const cors = require('cors');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const Session = require('./src/models/Session');
+const mongoSanitize = require('express-mongo-sanitize');
+const xss = require('xss-clean');
+
+
+const app = express();
+app.set('trust proxy', 1);
+const PORT = process.env.PORT || 3001;
+const createUserManagementRoutes = require('./src/routes/userManagement');
+
+
+const { 
+  createTransferInstruction, 
+  getAssociatedTokenAddress, 
+  createAssociatedTokenAccountInstruction, 
+  TOKEN_PROGRAM_ID, 
+  ASSOCIATED_TOKEN_PROGRAM_ID 
+} = require('@solana/spl-token');
+
+// --- System wallets (single source of truth) ---
+const SYSTEM_WALLETS = {
+  MAIN_TREASURY: process.env.MAIN_TREASURY_WALLET,
+  JACKPOT:       process.env.JACKPOT_WALLET,
+  OPERATIONS:    process.env.OPERATIONS_WALLET,
+  TEAM:          process.env.TEAM_WALLET,
+  COMMUNITY:     process.env.COMMUNITY_WALLET
+};
+
+// --- CORS CONFIGURATION ---
+// Updated to allow localhost:300* for development
+const ALLOW = [
+  /^https:\/\/.*\.vercel\.app$/,
+  
+  
+  'http://localhost:3000',
+  'http://localhost:3002',
+  'http://localhost:3003',
+  'http://localhost:3004',
+  'http://localhost:3005',
+  'http://localhost:8081',
+  'http://localhost:5173',
+  'https://gambino.gold',
+  'http://192.168.1.235:3000',
+  'http://192.168.1.235:3002',
+  'http://192.168.1.235:3003',
+  'http://192.168.1.235:3004',  // ADD THIS
+  'http://192.168.1.235:3005',
+  
+  'https://admin.gambino.gold',
+  'https://app.gambino.gold',
+];
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    const ok = ALLOW.some(x => x instanceof RegExp ? x.test(origin) : x === origin);
+    cb(ok ? null : new Error('CORS blocked: ' + origin), ok);
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  // Add 'x-admin-key' to allowedHeaders (THIS IS CRITICAL)
+  allowedHeaders: ['Authorization','Content-Type','X-Requested-With','x-admin-key'],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+
+const hubRoutes = require('./src/routes/hubs');
+app.use('/api/hubs', hubRoutes);
+app.use('/api/admin/hubs', hubRoutes); // Admin frontend expects this path
+// Token refresh routes for Pi auto-renewal
+app.use('/api/token', require('./src/routes/token-refresh'));
+
+
+
+
+// --- Security & parsers ---
+app.use(helmet());
+app.use(morgan('combined'));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Prevent NoSQL injection
+app.use(mongoSanitize({
+  replaceWith: '_',
+  onSanitize: ({ req, key }) => {
+    console.warn(`⚠️  Attempted NoSQL injection from ${req.ip}: ${key}`);
+  }
+}));
+
+// Prevent XSS attacks
+app.use(xss());
+
+console.log('✅ Input sanitization enabled');
+
+// ============================================================
+// HTTPS Enforcement (Production Only)
+// ============================================================
+//   if (process.env.NODE_ENV === 'production') {
+//     app.use((req, res, next) => {
+//       // Force HTTPS redirect
+//       if (req.header('x-forwarded-proto') !== 'https') {
+//         console.warn(`⚠️  HTTP request from ${req.ip} - redirecting to HTTPS`);
+//         return res.redirect(301, `https://${req.header('host')}${req.url}`);
+//       }
+//       // Add HSTS header
+//       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+//       next();
+//     });
+//     console.log('🔒 HTTPS enforcement enabled');
+//   } else {
+//     console.log('🔓 HTTPS enforcement disabled (development mode)');
+//   }
+
+// --- Rate limiting ---
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: process.env.NODE_ENV === 'production' ? 300 : 10000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS' || req.path === '/health',
+});
+app.use(globalLimiter);
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+});
+
+
+// Strict auth rate limiting
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,
+  skipSuccessfulRequests: true,
+  message: 'Too many authentication attempts, please try again in 15 minutes',
+});
+
+// --- RBAC SYSTEM IMPORTS (MOVED UP BEFORE USAGE) ---
+const {
+  authenticate,
+  requirePermission,
+  requireVenueAccess,
+  createVenueMiddleware,
+  verifyRoleFromDatabase, // SECURITY: Verify role from DB for sensitive operations
+  PERMISSIONS
+} = require('./src/middleware/rbac');
+
+// Wallet operations rate limiting
+const walletLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,
+  message: 'Too many wallet operations, please slow down',
+});
+
+// ============================================================
+// ADMIN RATE LIMITING - SECURITY FIX
+// ============================================================
+
+// Admin-specific rate limiting (general admin operations)
+const adminRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { 
+    error: 'Too many admin requests from this IP',
+    retryAfter: 900 
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  handler: (req, res) => {
+    const cfIp = req.headers['cf-connecting-ip'];
+    const realIp = cfIp || req.ip;
+    console.warn(`⚠️  Admin rate limit exceeded - Real IP: ${realIp}`);
+    res.status(429).json({
+      error: 'Too many admin requests',
+      retryAfter: 900
+    });
+  }
+});
+
+// Strict rate limiting for sensitive operations (treasury, user deletion, etc.)
+const strictRateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { 
+    error: 'Too many sensitive operation requests',
+    retryAfter: 3600 
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+ 
+  handler: (req, res) => {
+    const cfIp = req.headers['cf-connecting-ip'];
+    const realIp = cfIp || req.ip;
+    console.error(`🚨 STRICT rate limit exceeded - Real IP: ${realIp}`);
+    res.status(429).json({
+      error: 'Too many sensitive requests',
+      retryAfter: 3600
+    });
+  }
+});
+
+console.log('✅ Admin rate limiting configured');
+
+// Apply to specific routes
+// Apply admin rate limiters
+app.use('/api/admin', adminRateLimiter);
+app.use('/api/admin/treasury/mint', strictRateLimiter);
+app.use('/api/admin/treasury/burn', strictRateLimiter);
+app.use('/api/admin/treasury/transfer', strictRateLimiter);
+console.log('✅ Admin rate limiters applied to routes');
+
+
+// --- UTILITY FUNCTIONS ---
+const crypto = require('crypto');
+const fs = require('fs');
+const fsp = require('fs').promises;
+const path = require('path');
+
+const TX_DATA_DIR = process.env.TX_DATA_DIR || path.join(process.cwd(), 'gambino_data');
+const TX_JSONL_FILE = path.join(TX_DATA_DIR, 'transactions.jsonl');
+
+function encryptPrivateKey(secretKeyBase64) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(
+    'aes-256-cbc',
+    Buffer.from(process.env.WALLET_ENCRYPTION_KEY, 'hex'),
+    iv
+  );
+  let encrypted = cipher.update(secretKeyBase64, 'utf8', 'base64');
+  encrypted += cipher.final('base64');
+  return { encrypted, iv: iv.toString('base64') };
+}
+
+function decryptPrivateKey(encrypted, ivBase64) {
+  const iv = Buffer.from(ivBase64, 'base64');
+  const decipher = crypto.createDecipheriv(
+    'aes-256-cbc',
+    Buffer.from(process.env.WALLET_ENCRYPTION_KEY, 'hex'),
+    iv
+  );
+  let decrypted = decipher.update(encrypted, 'base64', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+
+async function appendJsonl(file, obj) {
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await fsp.appendFile(file, JSON.stringify(obj) + '\n', 'utf8');
+}
+
+async function readJsonl(file) {
+  try {
+    const content = await fsp.readFile(file, 'utf8');
+    const lines = content
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+    return lines.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  } catch {
+    return [];
+  }
+}
+
+const maskEmail = email => email ? email.replace(/(.{2})(.*)(@.*)/, '$1***$3') : null;
+const maskAddress = addr => addr ? `${addr.slice(0, 2)}…${addr.slice(-3)}` : 'unknown';
+
+const calculateGluckScore = (majorJackpots, minorJackpots, machinesPlayed) => {
+  const base = majorJackpots * 1000 + minorJackpots * 100;
+  const unique = new Set(machinesPlayed).size;
+  const mult = unique >= 7 ? 3 : unique >= 5 ? 2.5 : unique >= 3 ? 2 : unique >= 2 ? 1.5 : 1;
+  return Math.floor(base * mult);
+};
+
+const determineTier = (majorJackpots, minorJackpots, machinesPlayed) => {
+  const unique = new Set(machinesPlayed).size;
+  if (majorJackpots >= 7 && unique >= 3) return 'tier1';
+  if ((majorJackpots >= 1 && minorJackpots >= 10 && unique >= 2) || majorJackpots >= 2) return 'tier2';
+  if (minorJackpots >= 50 || (minorJackpots >= 20 && unique >= 2)) return 'tier3';
+  return 'none';
+};
+
+// --- SESSION REPAIR FUNCTIONS ---
+const repairSessionDatabase = async () => {
+  try {
+    console.log('🔧 Starting session database repair...');
+    
+    // Step 1: Drop ALL session indexes to avoid conflicts
+    try {
+      const indexes = await Session.collection.indexes();
+      for (const index of indexes) {
+        if (index.name !== '_id_') { // Never drop the _id index
+          try {
+            await Session.collection.dropIndex(index.name);
+            console.log(`📤 Dropped index: ${index.name}`);
+          } catch (dropErr) {
+            console.log(`⚠️ Could not drop ${index.name}: ${dropErr.message}`);
+          }
+        }
+      }
+    } catch (indexError) {
+      console.log('ℹ️ No existing indexes to drop');
+    }
+
+    // Step 2: Find problematic sessions
+    const problematicSessions = await Session.find({
+      $or: [
+        { sessionId: null },
+        { sessionId: { $exists: false } },
+        { sessionId: '' }
+      ]
+    });
+
+    console.log(`📊 Found ${problematicSessions.length} sessions with missing sessionId`);
+
+    // Step 3: Fix them
+    let fixedCount = 0;
+    for (const session of problematicSessions) {
+      try {
+        const newSessionId = crypto.randomBytes(16).toString('hex');
+        await Session.findByIdAndUpdate(session._id, { 
+          sessionId: newSessionId,
+          updatedAt: new Date()
+        });
+        fixedCount++;
+        
+        if (fixedCount % 20 === 0) {
+          console.log(`🔄 Fixed ${fixedCount}/${problematicSessions.length} sessions...`);
+        }
+      } catch (updateError) {
+        console.error(`❌ Failed to fix session ${session._id}:`, updateError.message);
+      }
+    }
+
+    console.log(`✅ Fixed ${fixedCount} sessions with missing sessionId`);
+
+    // Step 4: Recreate indexes carefully
+    const indexesToCreate = [
+      { fields: { userId: 1, status: 1 }, options: {} },
+      { fields: { userId: 1, startedAt: -1 }, options: {} },
+      { fields: { machineId: 1, status: 1 }, options: {} },
+      { fields: { startedAt: -1 }, options: {} },
+      { fields: { status: 1, endedAt: 1 }, options: {} },
+      { fields: { sessionId: 1 }, options: { unique: true, sparse: true } }
+    ];
+
+    for (const indexDef of indexesToCreate) {
+      try {
+        await Session.collection.createIndex(indexDef.fields, indexDef.options);
+        console.log(`📥 Created index on: ${Object.keys(indexDef.fields).join(', ')}`);
+      } catch (indexCreateError) {
+        console.error(`❌ Failed to create index on ${Object.keys(indexDef.fields).join(', ')}:`, indexCreateError.message);
+      }
+    }
+
+    // Step 5: Verification
+    const remainingProblematic = await Session.countDocuments({
+      $or: [
+        { sessionId: null },
+        { sessionId: { $exists: false } },
+        { sessionId: '' }
+      ]
+    });
+
+    if (remainingProblematic === 0) {
+      console.log('🎉 Session database repair completed successfully!');
+      return true;
+    } else {
+      console.log(`⚠️ ${remainingProblematic} sessions still need repair`);
+      return false;
+    }
+
+  } catch (error) {
+    console.error('❌ Session database repair failed:', error);
+    return false;
+  }
+};
+
+const cleanupOldSessions = async () => {
+  try {
+    // Use direct MongoDB operations since the Session model method might not exist
+    const thirtyDaysAgo = new Date(Date.now() - (30 * 24 * 60 * 60 * 1000));
+    const result = await Session.deleteMany({
+      status: 'completed',
+      endedAt: { $lt: thirtyDaysAgo }
+    });
+    
+    if (result.deletedCount > 0) {
+      console.log(`🧹 Cleaned up ${result.deletedCount} old completed sessions`);
+    }
+  } catch (error) {
+    console.error('Session cleanup error:', error);
+  }
+};
+
+// --- DATABASE CONNECTION ---
+const connectDB = async () => {
+  await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/gambino', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  });
+  console.log('📦 MongoDB connected');
+};
+
+const redis = require('redis');
+
+// Redis connection
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+redisClient.on('error', (err) => {
+  console.error('Redis Client Error:', err);
+});
+
+redisClient.on('connect', () => {
+  console.log('🔴 Redis connected');
+});
+
+// Connect to Redis
+const connectRedis = async () => {
+  try {
+    await redisClient.connect();
+    console.log('🔴 Redis connection established');
+  } catch (error) {
+    console.error('❌ Redis connection failed:', error);
+  }
+};
+
+// --- SCHEMAS & MODELS ---
+const userSchema = new mongoose.Schema({
+  firstName: String,
+  lastName: String,
+  email: { type: String, required: true, unique: true, lowercase: true },
+  phone: String,
+  username: { type: String, unique: true, sparse: true, lowercase: true },
+  password: { type: String, required: true, select: false },
+  walletAddress: { type: String, sparse: true, default: null },
+  privateKey: { type: String, default: null },
+  privateKeyIV: { type: String, default: null },
+  walletCreatedAt: { type: Date, default: null },
+  walletType: { type: String, enum: ['generated', 'connected', null], default: null },
+  agreedToTerms: { type: Boolean, default: false },
+  agreedToPrivacy: { type: Boolean, default: false },
+  marketingConsent: { type: Boolean, default: false },
+  agreementTimestamp: { type: Date, default: null },
+  readWhitepaper: { type: Boolean, default: false },
+  complianceVersion: { type: String, default: '1.0' },
+  ipAddress: { type: String },
+  role: {
+    type: String,
+    enum: ['user', 'venue_staff', 'venue_manager', 'gambino_ops', 'super_admin'],
+    default: 'user'
+  },
+  assignedVenues: {
+    type: [String],
+    default: [],
+    validate: {
+      validator: function(venues) {
+        if (['venue_staff'].includes(this.role)) {
+          return venues.length > 0;
+        }
+        if (['user', 'gambino_ops', 'super_admin'].includes(this.role)) {
+          return venues.length === 0;
+        }
+        return true;
+      },
+      message: 'Venue staff must have assigned venues. Other roles should not have venue assignments.'
+    }
+  },
+  gambinoBalance: { type: Number, default: 0 },
+  gluckScore: { type: Number, default: 0 },
+  tier: { type: String, enum: ['none', 'tier3', 'tier2', 'tier1'], default: 'none' },
+  totalJackpots: { type: Number, default: 0 },
+  majorJackpots: { type: Number, default: 0 },
+  minorJackpots: { type: Number, default: 0 },
+  machinesPlayed: [String],
+  favoriteLocation: String,
+  isVerified: { type: Boolean, default: false },
+  isActive: { type: Boolean, default: true },
+  createdAt: { type: Date, default: Date.now },
+  lastActivity: { type: Date, default: Date.now },
+  cachedSolBalance: { type: Number, default: 0 },
+  cachedGambinoBalance: { type: Number, default: 0 }, 
+  cachedUsdcBalance: { type: Number, default: 0 },
+  balanceLastUpdated: { type: Date, default: null },
+  balanceSyncAttempts: { type: Number, default: 0 },
+  balanceSyncError: { type: String, default: null },
+});
+
+userSchema.methods.hasRecoverableWallet = function() {
+  return this.walletAddress && this.privateKey && this.privateKeyIV;
+};
+
+userSchema.methods.isLegallyCompliant = function() {
+  return this.agreedToTerms && this.agreedToPrivacy && this.agreementTimestamp;
+};
+
+userSchema.methods.updateLegalAgreements = function(agreements) {
+  this.agreedToTerms = agreements.agreedToTerms;
+  this.agreedToPrivacy = agreements.agreedToPrivacy;
+  this.marketingConsent = agreements.marketingConsent || false;
+  this.readWhitepaper = agreements.readWhitepaper || false;
+  this.agreementTimestamp = new Date();
+  this.complianceVersion = '1.0';
+};
+
+// NEW: Venue access control methods
+userSchema.methods.hasVenueAccess = function(storeId) {
+  if (['super_admin', 'gambino_ops'].includes(this.role)) {
+    return true;
+  }
+  if (this.role === 'user') {
+    return true;
+  }
+  if (['venue_staff', 'venue_manager'].includes(this.role)) {
+    return this.assignedVenues.includes(storeId);
+  }
+  return false;
+};
+
+userSchema.methods.canManageVenue = function(storeId) {
+  if (['super_admin', 'gambino_ops'].includes(this.role)) {
+    return true;
+  }
+  if (this.role === 'venue_manager') {
+    return this.assignedVenues.includes(storeId);
+  }
+  return false;
+};
+
+userSchema.methods.canAccessAllVenues = function() {
+  return ['super_admin', 'gambino_ops'].includes(this.role);
+};
+
+userSchema.methods.getAccessibleVenues = function() {
+  if (this.canAccessAllVenues()) {
+    return 'all';
+  }
+  if (this.role === 'user') {
+    return 'all';
+  }
+  return this.assignedVenues || [];
+};
+
+userSchema.index({ email: 1 });
+userSchema.index({ username: 1 }, { sparse: true });
+userSchema.index({ walletAddress: 1 });
+userSchema.index({ gluckScore: -1 });
+userSchema.index({ cachedGambinoBalance: -1 });
+userSchema.index({ balanceLastUpdated: 1, walletAddress: 1 });
+userSchema.index({ role: 1, assignedVenues: 1 });
+userSchema.index({ assignedVenues: 1 });
+
+const User = mongoose.model('User', userSchema);
+
+const transferSchema = new mongoose.Schema({
+  fromUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  fromAddress: { type: String, required: true },
+  toAddress: { type: String, required: true },
+  amount: { type: Number, required: true },
+  memo: { type: String, maxlength: 100 },
+  txHash: { type: String, required: true, unique: true },
+  status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
+  networkFee: { type: Number, default: 0 },
+  errorMessage: { type: String },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Transfer = mongoose.model('Transfer', transferSchema);
+
+
+// Transfer routes (commented out - file doesn't exist)
+// const transferRoutes = require('./src/routes/transfers');
+// app.use('/api/wallet', transferRoutes);
+
+// Transaction Schema
+const transactionSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type: { type: String, enum: ['purchase', 'jackpot', 'burn', 'tier_reward', 'cashout', 'cashout_reversal'], required: true },
+  amount: { type: Number, required: true },
+  usdAmount: Number,
+  machineId: String,
+  txHash: String,
+  status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
+  gluckScoreChange: { type: Number, default: 0 },
+  metadata: Object,
+  createdAt: { type: Date, default: Date.now }
+});
+
+transactionSchema.index({ userId: 1, createdAt: -1 });
+transactionSchema.index({ type: 1 });
+transactionSchema.index({ 'metadata.storeId': 1, createdAt: -1 }); // For cashout queries
+transactionSchema.index({ 'metadata.staffMemberId': 1, createdAt: -1 }); // For staff cashout tracking
+const Transaction = mongoose.model('Transaction', transactionSchema);
+
+//Reconciliation Service
+const VenueReconciliation = require('./src/models/VenueReconciliation');
+const ReconciliationService = require('./src/services/ReconciliationService');
+
+// Store Schema
+const Store = require('./src/models/Store');
+
+// Machine Schema
+const Machine = require('./src/models/Machine');
+
+// Test wallet models loading
+try {
+  const { StoreWallet, WalletTransaction, Settlement } = require('./src/models/Wallet');
+  console.log('✅ Wallet models loaded successfully');
+} catch (error) {
+  console.error('❌ Failed to load wallet models:', error);
+}
+
+try {
+  const CustWalletService = require('./src/services/CustWalletService');
+  console.log('✅ Custodial wallet service loaded successfully');
+} catch (error) {
+  console.error('❌ Failed to load custodial wallet service:', error);
+}
+
+
+
+// --- BALANCE SYNC SERVICE (SIMPLIFIED) ---
+class BalanceSyncService {
+  constructor(connection, tokenMints) {
+    this.connection = connection;
+    this.tokenMints = tokenMints;
+    this.isRunning = false;
+    this.rateLimitDelay = 1000;
+    this.maxRetries = 3;
+    this.batchSize = 10;
+  }
+
+  async syncUserBalance(userId, retryCount = 0) {
+    // Simplified version - implement as needed
+    return { success: true, userId };
+  }
+
+  async batchSync(userIds = null, maxUsers = 20) {
+    if (this.isRunning) return { success: false, message: 'Sync already in progress' };
+    this.isRunning = true;
+    
+    try {
+      // Simplified implementation
+      return { success: true, totalProcessed: 0, successCount: 0, errorCount: 0 };
+    } finally {
+      this.isRunning = false;
+    }
+  }
+}
+
+// --- SOLANA CONNECTION ---
+const { Keypair, Connection, PublicKey } = require('@solana/web3.js');
+const QRCode = require('qrcode');
+const nacl = require('tweetnacl');
+const bs58 = require('bs58');
+
+const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+const connection = new Connection(SOLANA_RPC, "confirmed");
+
+const TOKEN_MINTS = {
+  GG: "Cd2wZyKVdWuyuJJHmeU1WmfSKNnDHku2m6mt6XFqGeXn", 
+  USDC: "Es9vMFrzaCERZ8YvKjWJ6dD3pDPnbuzcFh3RDFw4YcGJ"
+};
+
+const balanceSyncService = new BalanceSyncService(connection, TOKEN_MINTS);
+
+// --- TEMPORARY SESSION STORAGE ---
+const temporaryUsers = new Map();
+
+// --- HELPER FUNCTIONS ---
+function envTreasuryList() {
+  const map = [
+    ['MAIN_TREASURY','main'],
+    ['JACKPOT','jackpot'],
+    ['OPERATIONS','ops'],
+    ['TEAM','team'],
+    ['COMMUNITY','community']
+  ];
+  const out = [];
+  for (const [key, purpose] of map) {
+    const pk = SYSTEM_WALLETS[key];
+    if (pk) out.push({ label: key.toLowerCase(), purpose, publicKey: pk, source: 'env', createdAt: null });
+  }
+  return out;
+}
+
+// --- UNIFIED AUTH ROUTES ---
+const createAuthRoutes = require('./src/routes/auth');
+const authRoutes = createAuthRoutes(User); // Pass User model to auth routes
+app.use('/api/auth', authRoutes);
+
+
+
+
+// ===== ROUTES =====
+
+// Venue access summary endpoint for frontend
+app.get('/api/user/venue-access', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId).lean();
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const accessSummary = {
+      role: user.role,
+      assignedVenues: user.assignedVenues || [],
+      canAccessAllVenues: ['super_admin', 'gambino_ops', 'user'].includes(user.role),
+      canManageVenues: ['super_admin', 'gambino_ops', 'venue_manager'].includes(user.role),
+      accessType: user.role === 'user' ? 'gameplay' : 
+                  ['venue_staff', 'venue_manager'].includes(user.role) ? 'venue_assigned' : 
+                  'admin'
+    };
+
+    // If user has limited access, get store details for assigned venues
+    if (accessSummary.assignedVenues.length > 0) {
+      const stores = await Store.find({ 
+        storeId: { $in: accessSummary.assignedVenues } 
+      }).select('storeId storeName city state status').lean();
+      
+      accessSummary.assignedStores = stores;
+    }
+
+    res.json({ success: true, access: accessSummary });
+  } catch (error) {
+    console.error('Venue access summary error:', error);
+    res.status(500).json({ error: 'Failed to get access summary' });
+  }
+});
+
+// Test Redis endpoint
+app.get('/api/test-redis', async (req, res) => {
+  try {
+    // Test Redis connection
+    await redisClient.set('test_key', 'Hello from Redis!', 'EX', 60);
+    const value = await redisClient.get('test_key');
+    
+    res.json({
+      success: true,
+      message: 'Redis is working!',
+      value: value,
+      timestamp: new Date()
+    });
+  } catch (error) {
+    console.error('Redis test error:', error);
+    res.status(500).json({ error: 'Redis test failed' });
+  }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    version: '1.0.0'
+  });
+});
+
+
+// Password validation function
+function validatePassword(password) {
+  if (password.length < 12) {
+    return { valid: false, error: 'Password must be at least 12 characters' };
+  }
+  if (!/[A-Z]/.test(password)) {
+    return { valid: false, error: 'Password must contain an uppercase letter' };
+  }
+  if (!/[a-z]/.test(password)) {
+    return { valid: false, error: 'Password must contain a lowercase letter' };
+  }
+  if (!/[0-9]/.test(password)) {
+    return { valid: false, error: 'Password must contain a number' };
+  }
+  if (!/[!@#$%^&*()_+\-=\[\]{};:'",.<>?]/.test(password)) {
+    return { valid: false, error: 'Password must contain a special character' };
+  }
+  return { valid: true };
+}
+
+// USER REGISTRATION
+app.post('/api/users/register', async (req, res) => {
+  try {
+    const { firstName, lastName, email, phone, password } = req.body;
+
+    // Input validation
+    if (!firstName || !lastName) {
+      return res.status(400).json({ error: 'First and last name required' });
+    }
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    // Strong password validation - USE THE FUNCTION!
+    const passwordCheck = validatePassword(password);
+    if (!passwordCheck.valid) {
+      return res.status(400).json({ error: passwordCheck.error });
+    }
+
+    // Sanitize email
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const existing = await User.findOne({ email: normalizedEmail }).lean();
+    if (existing) {
+      console.warn(`⚠️  Registration attempt with existing email from ${req.ip}`);
+      return res.status(409).json({ error: 'Account already exists' });
+    }
+
+    const passwordHashed = await bcrypt.hash(password, 12);
+
+    const user = await User.create({
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      email: normalizedEmail,
+      phone: phone?.trim(),
+      password: passwordHashed,
+      gambinoBalance: 0,
+      gluckScore: 0,
+      tier: 'none',
+      role: 'user',
+      isVerified: true,
+      isActive: true,
+      assignedVenues: []
+    });
+
+    const accessToken = jwt.sign(
+      { 
+        userId: user._id, 
+        walletAddress: user.walletAddress, 
+        tier: user.tier, 
+        email: user.email,
+        role: user.role,
+        assignedVenues: user.assignedVenues,
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h', audience: 'gambino-users', issuer: 'gambino-admin' }
+    );
+
+    console.log(`✅ User registered: ${maskEmail(user.email)}`);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Account created',
+      user: {
+        id: user._id,
+        email: user.email,
+        walletAddress: user.walletAddress,
+        gambinoBalance: user.gambinoBalance,
+        gluckScore: user.gluckScore,
+        tier: user.tier,
+        role: user.role,
+        createdAt: user.createdAt
+      },
+      accessToken
+    });
+  } catch (err) {
+    console.error('❌ /api/users/register error:', err);
+    
+    // Don't expose internal errors
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'Account already exists' });
+    }
+    
+    return res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// ADMIN USER MANAGEMENT ROUTES
+// SECURITY: Verify role from DB to prevent role escalation attacks
+app.use('/api/admin/users', authenticate, verifyRoleFromDatabase, createUserManagementRoutes(User, Session, Transfer, Transaction));
+
+
+
+// ADMIN METRICS
+app.get('/api/admin/metrics', authenticate, requirePermission(PERMISSIONS.VIEW_ALL_METRICS), async (req, res) => {
+  try {
+    const { timeframe = '30d' } = req.query;
+    
+    // Calculate date range based on timeframe
+    let startDate = new Date();
+    switch(timeframe) {
+      case '7d':
+        startDate.setDate(startDate.getDate() - 7);
+        break;
+      case '30d':
+        startDate.setDate(startDate.getDate() - 30);
+        break;
+      case '90d':
+        startDate.setDate(startDate.getDate() - 90);
+        break;
+      default:
+        startDate.setDate(startDate.getDate() - 30);
+    }
+
+    // Get basic metrics
+    const [
+      totalUsers,
+      activeUsers,
+      totalTransfers,
+      recentUsers
+    ] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ lastActivity: { $gte: startDate } }),
+      Transfer.countDocuments({ createdAt: { $gte: startDate } }),
+      User.countDocuments({ createdAt: { $gte: startDate } })
+    ]);
+
+    const metrics = {
+      users: {
+        total: totalUsers,
+        active: activeUsers,
+        new: recentUsers
+      },
+      transfers: {
+        total: totalTransfers
+      },
+      timeframe,
+      lastUpdated: new Date()
+    };
+
+    res.json({
+      success: true,
+      metrics
+    });
+
+  } catch (error) {
+    console.error('Admin metrics error:', error);
+    res.status(500).json({ error: 'Failed to load metrics' });
+  }
+});
+
+// NEW: MACHINE METRICS ENDPOINT - Aggregated machine & store data
+app.get('/api/admin/machine-metrics', authenticate, requirePermission(PERMISSIONS.VIEW_ALL_METRICS), async (req, res) => {
+  try {
+    const { storeId, timeframe = '7d' } = req.query;
+    
+    // Calculate date range
+    let startDate = new Date();
+    switch(timeframe) {
+      case '24h':
+        startDate.setDate(startDate.getDate() - 1);
+        break;
+      case '7d':
+        startDate.setDate(startDate.getDate() - 7);
+        break;
+      case '30d':
+        startDate.setDate(startDate.getDate() - 30);
+        break;
+      case '90d':
+        startDate.setDate(startDate.getDate() - 90);
+        break;
+      default:
+        startDate.setDate(startDate.getDate() - 7);
+    }
+
+    // Build query filter for DailyReports
+    const reportFilter = {
+      printedAt: { $gte: startDate }
+    };
+
+    // If venue manager, filter by their stores
+    if (req.user.role === 'venue_manager' && req.user.assignedVenues) {
+      reportFilter.storeId = { $in: req.user.assignedVenues };
+    } else if (storeId) {
+      reportFilter.storeId = storeId;
+    }
+
+    console.log('🔍 Machine metrics filter:', reportFilter);
+
+    // Get all reports in timeframe
+    const allReports = await DailyReport.find(reportFilter).lean();
+
+    // Group by store + date, keep only LATEST report per day
+    const latestReportsByDate = {};
+    allReports.forEach(report => {
+      const dateKey = `${report.storeId}_${report.printedAt.toISOString().split('T')[0]}`;
+      if (!latestReportsByDate[dateKey] || 
+          new Date(report.printedAt) > new Date(latestReportsByDate[dateKey].printedAt)) {
+        latestReportsByDate[dateKey] = report;
+      }
+    });
+
+    const latestReports = Object.values(latestReportsByDate);
+
+    // Aggregate by machine from latest reports
+    const machineStats = {};
+    latestReports.forEach(report => {
+      if (report.machineData && Array.isArray(report.machineData)) {
+        report.machineData.forEach(machine => {
+          const key = `${report.storeId}_${machine.machineId}`;
+          if (!machineStats[key]) {
+            machineStats[key] = {
+              machineId: machine.machineId,
+              storeId: report.storeId,
+              moneyIn: 0,
+              moneyOut: 0,
+              totalEvents: 0
+            };
+          }
+          machineStats[key].moneyIn += machine.moneyIn || 0;
+          machineStats[key].moneyOut += machine.collect || 0;
+          machineStats[key].totalEvents += machine.transactionCount || 0;
+        });
+      }
+    });
+
+
+// Merge voucher data into machine stats
+// 1. Calculate machine stats (without vouchers yet)
+const machineStatsArray = Object.values(machineStats).map(m => ({
+  ...m,
+  netRevenue: m.moneyIn - m.moneyOut,
+  profitMargin: m.moneyIn > 0 ? ((m.moneyIn - m.moneyOut) / m.moneyIn) * 100 : 0
+}));
+
+// 2. Aggregate by store (money in only)
+const storeStats = {};
+latestReports.forEach(report => {
+  if (!storeStats[report.storeId]) {
+    storeStats[report.storeId] = {
+      storeId: report.storeId,
+      moneyIn: 0,
+      moneyOut: 0
+    };
+  }
+  storeStats[report.storeId].moneyIn += report.totalRevenue || 0;
+});
+
+// 3. Get vouchers for money out
+const voucherFilter = {
+  timestamp: { $gte: startDate },
+  eventType: 'voucher_print'
+};
+if (req.user.role === 'venue_manager' && req.user.assignedVenues) {
+  voucherFilter.storeId = { $in: req.user.assignedVenues };
+} else if (storeId) {
+  voucherFilter.storeId = storeId;
+}
+
+const voucherEvents = await Event.find(voucherFilter).lean();
+console.log(`💸 Found ${voucherEvents.length} voucher events, total: $${voucherEvents.reduce((sum, e) => sum + (e.amount || 0), 0)}`);
+
+// 4. Add vouchers to store stats
+voucherEvents.forEach(event => {
+  if (storeStats[event.storeId]) {
+    storeStats[event.storeId].moneyOut += event.amount || 0;
+  }
+});
+
+// 5. Calculate net revenue and Gambino cut
+const storeStatsArray = Object.values(storeStats).map(s => ({
+  ...s,
+  netRevenue: s.moneyIn - s.moneyOut,
+  gambinoCut: (s.moneyIn - s.moneyOut) * 0.05
+}));
+
+// 6. Get vouchers per machine
+const machineVouchers = await Event.aggregate([
+  {
+    $match: {
+      timestamp: { $gte: startDate },
+      eventType: 'voucher_print',
+      storeId: { $in: storeStatsArray.map(s => s.storeId) }
+    }
+  },
+  {
+    $group: {
+      _id: {
+        machineId: '$gamingMachineId',
+        storeId: '$storeId'
+      },
+      totalVouchers: { $sum: '$amount' },
+      voucherCount: { $sum: 1 }
+    }
+  }
+]);
+
+// 7. Merge voucher data into machine stats
+const machineStatsWithVouchers = machineStatsArray.map(machine => {
+  const vouchers = machineVouchers.find(v => 
+    v._id.machineId === machine.machineId && 
+    v._id.storeId === machine.storeId
+  );
+  
+  const moneyOut = vouchers?.totalVouchers || 0;
+  const netRevenue = machine.moneyIn - moneyOut;
+  
+  return {
+    ...machine,
+    moneyOut,
+    netRevenue,
+    profitMargin: machine.moneyIn > 0 ? ((netRevenue / machine.moneyIn) * 100) : 0,
+    voucherCount: vouchers?.voucherCount || 0
+  };
+});
+
+// 8. Get machine count
+const machineCountQuery = storeId ? { storeId } :
+  (req.user.role === 'venue_manager' && req.user.assignedVenues) ?
+    { storeId: { $in: req.user.assignedVenues } } : {};
+const totalMachines = await Machine.countDocuments(machineCountQuery);
+
+console.log(`📊 Machine metrics: ${machineStatsWithVouchers.length} machines, ${storeStatsArray.length} stores (from ${latestReports.length} latest reports)`);
+
+res.json({
+  success: true,
+  timeframe,
+  summary: {
+    totalMachines,
+    totalStores: storeStatsArray.length,
+    systemMoneyIn: storeStatsArray.reduce((sum, s) => sum + s.moneyIn, 0),
+    systemMoneyOut: storeStatsArray.reduce((sum, s) => sum + s.moneyOut, 0),
+    systemNetRevenue: storeStatsArray.reduce((sum, s) => sum + s.netRevenue, 0),
+  },
+  byStore: storeStatsArray,
+  byMachine: machineStatsWithVouchers,  // ← Use this instead of machineStatsArray
+  lastUpdated: new Date()
+});
+  } catch (error) {
+    console.error('Machine metrics error:', error);
+    res.status(500).json({ error: 'Failed to load machine metrics' });
+  }
+});
+
+// PHASE 3: RECONCILIATION ROUTES  
+const { router: reconciliationRouter } = require('./src/routes/reconciliation');
+app.use('/api/admin/reconciliation', reconciliationRouter);
+
+// NEW: DAILY REPORTS ROUTES
+const { router: reportsRouter, setupMiddleware: setupReportsMiddleware, setupModels: setupReportsModels } = require('./src/routes/admin/reports');
+
+const eventsRouter = require('./src/routes/events');
+app.use('/api/admin/events', eventsRouter);  
+
+// Setup middleware for reports routes
+setupReportsMiddleware(authenticate, requirePermission, createVenueMiddleware);
+
+// Setup models (you'll need to import/require DailyReport model)
+const DailyReport = require('./src/models/DailyReport');
+const Event = require('./src/models/Event'); // If you have this model
+setupReportsModels(DailyReport, Event);
+
+// Mount reports routes
+app.use('/api/admin/reports', reportsRouter);
+
+// USER PROFILE
+app.get('/api/users/profile', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    return res.json({
+      success: true,
+      user: {
+        id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        phone: user.phone,
+        email: user.email,
+        walletAddress: user.walletAddress || null,
+        gambinoBalance: user.gambinoBalance,
+        gluckScore: user.gluckScore,
+        tier: user.tier,
+        role: user.role || 'user',
+        assignedVenues: user.assignedVenues || [],
+        totalJackpots: user.totalJackpots,
+        majorJackpots: user.majorJackpots,
+        minorJackpots: user.minorJackpots,
+        machinesPlayed: user.machinesPlayed,
+        createdAt: user.createdAt,
+        lastActivity: user.lastActivity,
+        cachedSolBalance: user.cachedSolBalance || 0,
+        cachedGambinoBalance: user.cachedGambinoBalance || 0,
+        cachedUsdcBalance: user.cachedUsdcBalance || 0,
+        balanceLastUpdated: user.balanceLastUpdated,
+        balanceSyncError: user.balanceSyncError
+      }
+    });
+  } catch (error) {
+    console.error('❌ Profile fetch error:', error);
+    return res.status(500).json({ error: 'Failed to fetch profile' });
+  }
+});
+
+// USER SESSION ROUTES
+app.get('/api/users/current-session', authenticate, async (req, res) => {
+  try {
+    const activeSession = await Session.findOne({ 
+      userId: req.user.userId, 
+      status: 'active' 
+    });
+
+    if (!activeSession) {
+      return res.json({ session: null });
+    }
+
+    // Get machine and store details
+    const [machine, store] = await Promise.all([
+      Machine.findOne({ machineId: activeSession.machineId }),
+      Store.findOne({ storeId: activeSession.storeId })
+    ]);
+
+    const sessionData = {
+      sessionId: activeSession.sessionId || activeSession._id,
+      machineId: activeSession.machineId,
+      machineName: machine?.name || activeSession.machineName || activeSession.machineId,
+      storeId: activeSession.storeId,
+      storeName: store?.storeName || activeSession.storeName || 'Unknown Store',
+      location: machine?.location || activeSession.location,
+      status: activeSession.status,
+      startedAt: activeSession.startedAt,
+      lastActivity: activeSession.lastActivity,
+      totalBets: activeSession.totalBets,
+      totalWinnings: activeSession.totalWinnings,
+      duration: Math.floor((Date.now() - new Date(activeSession.startedAt)) / 60000)
+    };
+
+    res.json({ session: sessionData });
+  } catch (error) {
+    console.error('Current session error:', error);
+    res.status(500).json({ error: 'Failed to get session' });
+  }
+});
+
+app.get('/api/debug/my-sessions', authenticate, async (req, res) => {
+  try {
+    const sessions = await Session.find({ userId: req.user.userId }).limit(5).lean();
+    
+    const analysis = sessions.map(session => ({
+      _id: session._id,
+      sessionId: session.sessionId,
+      hasSessionId: !!(session.sessionId),
+      machineId: session.machineId,
+      status: session.status,
+      startedAt: session.startedAt,
+      createdAt: session.createdAt
+    }));
+
+    res.json({
+      success: true,
+      totalSessions: sessions.length,
+      sessionsWithIds: sessions.filter(s => s.sessionId).length,
+      sessionsSample: analysis,
+      rawSample: sessions[0] || null
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/users/session-history', authenticate, async (req, res) => {
+  try {
+    const { limit = 20 } = req.query;
+    
+    console.log(`🔍 Loading session history for user ${req.user.userId}`);
+    
+    const sessions = await Session.find({ 
+      userId: req.user.userId 
+    })
+    .sort({ startedAt: -1 })
+    .limit(parseInt(limit))
+    .lean();
+
+    console.log(`📊 Found ${sessions.length} sessions for user ${req.user.userId}`);
+
+    const enrichedSessions = await Promise.all(
+      sessions.map(async (session) => {
+        const [machine, store] = await Promise.all([
+          Machine.findOne({ machineId: session.machineId }).lean(),
+          Store.findOne({ storeId: session.storeId }).lean()
+        ]);
+
+        return {
+          sessionId: session.sessionId || session._id,
+          machineId: session.machineId,
+          machineName: machine?.name || session.machineName,
+          storeName: store?.storeName || session.storeName,
+          location: machine?.location || session.location,
+          startedAt: session.startedAt,
+          endedAt: session.endedAt,
+          duration: session.endedAt ? 
+            Math.round((session.endedAt - session.startedAt) / (1000 * 60)) : 
+            Math.round((new Date() - session.startedAt) / (1000 * 60)),
+          status: session.status,
+          totalBets: session.totalBets || 0,
+          totalWinnings: session.totalWinnings || 0
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      sessions: enrichedSessions,
+      totalSessions: sessions.length
+    });
+  } catch (error) {
+    console.error('Session history error:', error);
+    res.status(500).json({ error: 'Failed to load session history' });
+  }
+});
+
+app.post('/api/users/end-session', authenticate, async (req, res) => {
+  try {
+    const activeSession = await Session.findOne({ 
+      userId: req.user.userId, 
+      status: 'active' 
+    });
+
+    if (!activeSession) {
+      return res.status(404).json({ error: 'No active session found' });
+    }
+
+    await activeSession.endSession();
+
+    console.log(`✅ Session ended for user ${req.user.userId} on machine ${activeSession.machineId}`);
+
+    res.json({ 
+      success: true, 
+      message: 'Session ended successfully',
+      sessionId: activeSession.sessionId || activeSession._id 
+    });
+  } catch (error) {
+    console.error('End session error:', error);
+    res.status(500).json({ error: 'Failed to end session' });
+  }
+});
+
+// USER PROFILE UPDATE ROUTES
+app.put('/api/users/profile', authenticate, async (req, res) => {
+  try {
+    const { firstName, lastName, phone, email } = req.body;
+    const userId = req.user.userId;
+
+    if (firstName && firstName.trim().length === 0) {
+      return res.status(400).json({ error: 'First name cannot be empty' });
+    }
+    if (lastName && lastName.trim().length === 0) {
+      return res.status(400).json({ error: 'Last name cannot be empty' });
+    }
+    
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (email && email !== user.email) {
+      const existingUser = await User.findOne({ email: email.toLowerCase() });
+      if (existingUser) {
+        return res.status(409).json({ error: 'Email already in use' });
+      }
+      user.email = email.toLowerCase();
+    }
+
+    if (firstName !== undefined) user.firstName = firstName.trim();
+    if (lastName !== undefined) user.lastName = lastName.trim();
+    if (phone !== undefined) user.phone = phone;
+    
+    user.lastActivity = new Date();
+    await user.save();
+    
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      user: {
+        id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        phone: user.phone
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Profile update error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+app.post('/api/users/change-password', authenticate, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current and new passwords are required' });
+    }
+
+    // Validate new password strength
+    const passwordCheck = validatePassword(newPassword);
+    if (!passwordCheck.valid) {
+      return res.status(400).json({ error: passwordCheck.error });
+    }
+
+    const user = await User.findById(req.user.userId).select('+password');
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.password) {
+      return res.status(400).json({ error: 'Password not set for this account' });
+    }
+
+    const ok = await bcrypt.compare(currentPassword, user.password);
+    if (!ok) {
+      console.warn(`⚠️  Failed password change attempt for ${maskEmail(user.email)} from ${req.ip}`);
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 12);
+    user.lastActivity = new Date();
+    await user.save();
+
+    console.log(`✅ Password changed for ${maskEmail(user.email)}`);
+
+    res.json({ success: true, message: 'Password changed successfully' });
+  } catch (error) {
+    console.error('❌ Password change error:', error);
+    res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
+// WALLET OPERATIONS
+app.post('/api/wallet/generate', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    if (user.walletAddress) {
+      return res.status(400).json({ error: "Wallet already exists for this user" });
+    }
+
+    const keypair = Keypair.generate();
+    const publicKey = keypair.publicKey.toBase58();
+    const privateKeyBase64 = Buffer.from(keypair.secretKey).toString('base64');
+
+    const { encrypted, iv } = encryptPrivateKey(privateKeyBase64);
+
+    user.walletAddress = publicKey;
+    user.privateKey = encrypted;
+    user.privateKeyIV = iv;
+    user.walletCreatedAt = new Date();  // ADD THIS
+    user.walletType = 'generated';      // ADD THIS
+    await user.save();
+
+    console.log(`💳 Wallet generated for ${user.email}: ${publicKey.slice(0, 8)}...`);
+
+    return res.json({
+      success: true,
+      walletAddress: publicKey,
+      hasRecoverableKey: true,
+      note: "Wallet ready for use"
+    });
+  } catch (err) {
+    console.error("Wallet generation error:", err);
+    return res.status(500).json({ error: "Failed to generate wallet" });
+  }
+});
+
+app.get('/api/wallet/balance/:walletAddress', async (req, res) => {
+  try {
+    const { walletAddress } = req.params;
+    const { updateDB } = req.query;
+    const pubKey = new PublicKey(walletAddress);
+
+    const solBalance = await connection.getBalance(pubKey);
+
+    const tokenBalances = {};
+    for (const [symbol, mint] of Object.entries(TOKEN_MINTS)) {
+      try {
+        const accounts = await connection.getParsedTokenAccountsByOwner(pubKey, {
+          mint: new PublicKey(mint)
+        });
+
+        if (accounts.value.length > 0) {
+          tokenBalances[symbol] =
+            accounts.value[0].account.data.parsed.info.tokenAmount.uiAmount;
+        } else {
+          tokenBalances[symbol] = 0;
+        }
+      } catch (err) {
+        tokenBalances[symbol] = null;
+      }
+    }
+
+    const balances = {
+      SOL: solBalance / 1e9,
+      ...tokenBalances
+    };
+
+    if (updateDB === 'true' && balances.GG !== null) {
+      try {
+        await User.findOneAndUpdate(
+          { walletAddress },
+          {
+            cachedSolBalance: balances.SOL,
+            cachedGambinoBalance: balances.GG,
+            cachedUsdcBalance: balances.USDC || 0,
+            balanceLastUpdated: new Date(),
+            balanceSyncError: null,
+            balanceSyncAttempts: 0
+          },
+          { new: true }
+        );
+        
+        console.log(`✅ Updated cached balances for wallet ${walletAddress.slice(0, 8)}...`);
+      } catch (dbError) {
+        console.error('Failed to update cached balances:', dbError);
+      }
+    }
+
+    res.json({
+      success: true,
+      balances
+    });
+  } catch (error) {
+    console.error("❌ Balance fetch error:", error);
+    
+    if (updateDB === 'true') {
+      try {
+        const user = await User.findOne({ walletAddress: req.params.walletAddress });
+        if (user && user.balanceLastUpdated) {
+          console.log(`⚠️ RPC failed, returning cached balances for ${req.params.walletAddress.slice(0, 8)}...`);
+          return res.json({
+            success: true,
+            balances: {
+              SOL: user.cachedSolBalance || 0,
+              GG: user.cachedGambinoBalance || 0,
+              USDC: user.cachedUsdcBalance || 0
+            },
+            cached: true,
+            lastUpdated: user.balanceLastUpdated
+          });
+        }
+      } catch (cacheError) {
+        console.error('Failed to fetch cached balances:', cacheError);
+      }
+    }
+    
+    res.status(500).json({ error: "Failed to fetch balances" });
+  }
+});
+
+app.get('/api/wallet/qrcode/:walletAddress', async (req, res) => {
+  try {
+    const { walletAddress } = req.params;
+    const qr = await QRCode.toDataURL(walletAddress);
+    res.json({ success: true, walletAddress, qr });
+  } catch (error) {
+    console.error("❌ QR code error:", error);
+    res.status(500).json({ error: "Failed to generate QR code" });
+  }
+});
+
+app.get('/api/wallet/private-key', authenticate, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    if (!user || !user.privateKey || !user.privateKeyIV) {
+      return res.status(404).json({ error: 'No recoverable key on file' });
+    }
+    const privateKeyBase64 = decryptPrivateKey(user.privateKey, user.privateKeyIV);
+    return res.json({ success: true, privateKey: privateKeyBase64 });
+  } catch (e) {
+    console.error('private-key error:', e);
+    res.status(500).json({ error: 'Failed to retrieve private key' });
+  }
+});
+
+app.post('/api/wallet/connect', authenticate, async (req, res) => {
+  try {
+    const { publicKey, message, signatureBase64 } = req.body || {};
+    // ... validation code ...
+
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (user.walletAddress) {
+      return res.status(409).json({ error: 'Wallet already set for this account' });
+    }
+
+    const taken = await User.findOne({ walletAddress: publicKey });
+    if (taken) return res.status(409).json({ error: 'That wallet is already linked to another account' });
+
+    user.walletAddress = publicKey;
+    user.privateKey = null;
+    user.privateKeyIV = null;
+    user.walletCreatedAt = new Date();  // ADD THIS
+    user.walletType = 'connected';       // ADD THIS
+    user.lastActivity = new Date();
+    await user.save();
+
+    console.log(`🔗 External wallet connected for ${user.email}: ${publicKey.slice(0, 8)}...`);
+
+    return res.json({ success: true, walletAddress: publicKey });
+  } catch (e) {
+    console.error('❌ /api/wallet/connect error:', e);
+    return res.status(500).json({ error: 'Failed to link wallet' });
+  }
+});
+
+// ADMIN STORE MANAGEMENT
+app.get('/api/admin/stores', authenticate, requirePermission(PERMISSIONS.MANAGE_ASSIGNED_STORES), async (req, res) => {
+  try {
+    const { q } = req.query;
+    const userRole = req.user.role;
+    const assignedVenues = req.user.assignedVenues || [];
+
+    let where = {};
+    
+    if (q) {
+      where.$or = [
+        { storeId: new RegExp(q, 'i') },
+        { storeName: new RegExp(q, 'i') },
+        { city: new RegExp(q, 'i') },
+        { state: new RegExp(q, 'i') },
+      ];
+    }
+
+    if (userRole === 'venue_manager' && assignedVenues.length > 0) {
+      where.storeId = { $in: assignedVenues };
+    }
+
+    const stores = await Store.find(where)
+      .sort({ createdAt: -1 })
+      .limit(1000)
+      .lean();
+
+    res.json({ 
+      success: true, 
+      stores, 
+      count: stores.length,
+      accessInfo: {
+        role: userRole,
+        restrictedToVenues: userRole === 'venue_manager',
+        assignedVenues: assignedVenues
+      }
+    });
+  } catch (e) {
+    console.error('admin stores list error:', e);
+    res.status(500).json({ error: 'Failed to fetch stores' });
+  }
+});
+
+app.get('/api/admin/stores/:storeId', ...createVenueMiddleware({ action: 'view_store_details' }), async (req, res) => {
+  try {
+    res.json({ 
+      success: true, 
+      store: req.store,
+      accessInfo: req.venueAccess 
+    });
+  } catch (e) {
+    console.error('admin store get error:', e);
+    res.status(500).json({ error: 'Failed to load store' });
+  }
+});
+
+app.put('/api/admin/stores/:storeId', ...createVenueMiddleware({ requireManagement: true, action: 'update_store' }), async (req, res) => {
+  try {
+    const allowed = [
+      'storeName','city','state','address','zipCode','phone',
+      'feePercentage','status','ownerUserId'
+    ];
+    const patch = {};
+    for (const k of allowed) {
+      if (k in req.body) patch[k] = req.body[k];
+    }
+
+    if ('feePercentage' in patch) {
+      patch.feePercentage = Math.max(0, Math.min(100, Number(patch.feePercentage) || 0));
+    }
+    if ('status' in patch && !['active','inactive','suspended','archived','deleted','maintenance','pending'].includes(patch.status)) {
+      delete patch.status;
+    }
+    patch.updatedAt = new Date();
+
+    const s = await Store.findOneAndUpdate(
+      { storeId: req.params.storeId }, 
+      patch, 
+      { new: true }
+    );
+    
+    if (!s) return res.status(404).json({ error: 'Store not found' });
+    
+    res.json({ success: true, store: s });
+  } catch (e) {
+    console.error('admin store update error:', e);
+    res.status(500).json({ error: 'Failed to update store' });
+  }
+});
+
+app.post('/api/admin/stores/create', authenticate, requirePermission(PERMISSIONS.MANAGE_ASSIGNED_STORES), async (req, res) => {
+  try {
+    const role = req.user.role;
+    const { 
+      storeId, storeName, city, state, 
+      address='', zipCode='', phone='', 
+      feePercentage=5 
+    } = req.body || {};
+    
+    if (!storeId || !storeName || !city || !state) {
+      return res.status(400).json({ 
+        error: 'storeId, storeName, city, state required' 
+      });
+    }
+
+    const exists = await Store.findOne({ storeId });
+    if (exists) {
+      return res.status(409).json({ error: 'storeId already exists' });
+    }
+
+    const doc = await Store.create({
+      storeId, 
+      storeName, 
+      city, 
+      state, 
+      address, 
+      zipCode, 
+      phone,
+      feePercentage: Number(feePercentage) || 0,
+      status: 'active', 
+      createdAt: new Date()
+    });
+
+    if (role === 'venue_manager') {
+      await User.findByIdAndUpdate(
+        req.user.userId,
+        { $addToSet: { assignedVenues: storeId } }
+      );
+      
+      console.log(`🏪 Auto-assigned venue manager to new store: ${storeId}`);
+    }
+
+    res.status(201).json({ success: true, store: doc });
+  } catch (e) {
+    console.error('admin store create error:', e);
+    res.status(500).json({ error: 'Failed to create store' });
+  }
+});
+
+// UPDATE USER (Admin only)
+app.put('/api/admin/users/:userId', authenticate, requirePermission(PERMISSIONS.MANAGE_USERS), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { firstName, lastName, email, phone, role, assignedVenues, isActive } = req.body;
+
+    console.log('📝 Update user request:', { userId, body: req.body });
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const updates = {};
+    if (firstName !== undefined) updates.firstName = firstName.trim();
+    if (lastName !== undefined) updates.lastName = lastName.trim();
+    if (email !== undefined) updates.email = email.toLowerCase().trim();
+    if (phone !== undefined) updates.phone = phone.trim();
+    if (role !== undefined) updates.role = role;
+    if (assignedVenues !== undefined) updates.assignedVenues = assignedVenues;
+    if (isActive !== undefined) updates.isActive = isActive;
+
+    const updatedUser = await User.findByIdAndUpdate(
+      userId, 
+      updates, 
+      { new: true, runValidators: true }
+    ).select('firstName lastName email role assignedVenues isActive');
+
+    console.log('✅ User updated:', updatedUser.email);
+
+    res.json({ 
+      success: true, 
+      message: 'User updated successfully',
+      user: updatedUser
+    });
+  } catch (error) {
+    console.error('Update user error:', error);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// STORE WALLET MANAGEMENT
+app.get('/api/admin/wallet/:storeId', ...createVenueMiddleware({ requireManagement: true, action: 'view_store_wallet' }), async (req, res) => {
+  try {
+    const store = req.store;
+    const publicKey = store.walletAddress || null;
+    let balances = null;
+
+    if (publicKey) {
+      const pubKey = new PublicKey(publicKey);
+      const sol = await connection.getBalance(pubKey);
+      const out = { SOL: sol / 1e9 };
+      
+      for (const [symbol, mint] of Object.entries(TOKEN_MINTS)) {
+        try {
+          const accs = await connection.getParsedTokenAccountsByOwner(
+            pubKey, 
+            { mint: new PublicKey(mint) }
+          );
+          out[symbol] = accs.value.length ? 
+            accs.value[0].account.data.parsed.info.tokenAmount.uiAmount : 0;
+        } catch { 
+          out[symbol] = null; 
+        }
+      }
+      balances = out;
+    }
+
+    res.json({ 
+      success: true, 
+      wallet: { publicKey, balances },
+      storeInfo: {
+        storeId: store.storeId,
+        storeName: store.storeName
+      }
+    });
+  } catch (e) {
+    console.error('wallet get error:', e);
+    res.status(500).json({ error: 'Failed to load wallet' });
+  }
+});
+
+app.post('/api/admin/wallet/:storeId/generate', ...createVenueMiddleware({ requireManagement: true, action: 'generate_store_wallet' }), async (req, res) => {
+  try {
+    const store = req.store;
+    
+    if (store.walletAddress) {
+      return res.status(409).json({ error: 'Wallet already exists' });
+    }
+
+    const kp = Keypair.generate();
+    const publicKey = kp.publicKey.toBase58();
+
+    await Store.findOneAndUpdate(
+      { storeId: req.params.storeId },
+      { walletAddress: publicKey }
+    );
+
+    res.json({ 
+      success: true, 
+      wallet: { publicKey },
+      message: 'Store wallet generated successfully'
+    });
+  } catch (e) {
+    console.error('wallet generate error:', e);
+    res.status(500).json({ error: 'Failed to generate wallet' });
+  }
+});
+
+// MACHINE MANAGEMENT
+app.use('/api/machines', require('./src/routes/machines'));
+
+// MACHINE DETAILS & ANALYTICS (more specific route first)
+app.use('/api/admin/machines', require('./src/routes/routes-machine-details'));
+
+// HUB MANAGEMENT (remove duplicate)
+// REMOVED: Duplicate hubs mount (cleanup script)
+
+// EDGE DEVICE OPERATIONS
+app.use('/api/edge', require('./src/routes/edge'));
+
+// TREASURY MANAGEMENT
+// SECURITY: Verify role from DB to prevent unauthorized treasury access
+app.use('/api/admin/treasury', authenticate, verifyRoleFromDatabase, requirePermission(PERMISSIONS.VIEW_ALL_METRICS), require('./src/routes/blockchainTreasuryRoutes'));
+// Distribution Dashboard - simple routes for viewing treasury balances
+app.use('/api/distribution', authenticate, verifyRoleFromDatabase, requirePermission(PERMISSIONS.SYSTEM_ADMIN), require('./src/routes/distributionRoutes'));
+
+// CASHOUT MANAGEMENT
+app.use('/api/cashout', require('./src/routes/cashout'));
+
+// ANALYTICS ROUTES
+app.use('/api', require('./src/routes/analytics'));
+
+
+
+
+// REMOVED: Inline leaderboard route (manual cleanup)
+// Moved to entropy-game-backend
+
+// REMOVED: Mobile mining integration (cleanup script)
+// ============================================
+
+// ===== ENTROPY ROUTES =====
+// REMOVED: Entropy routes (cleanup script)
+
+// ============================================
+// MongoDB Connection & Server Startup
+// ============================================
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => {
+  console.log('✅ MongoDB connected successfully');
+
+  // Start server only after DB connection
+  app.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  });
+})
+.catch((err) => {
+  console.error('❌ MongoDB connection error:', err);
+  process.exit(1);
+});

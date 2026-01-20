@@ -58,14 +58,6 @@ const userSchema = new mongoose.Schema({
   
   // Gaming Stats
   gluckScore: { type: Number, default: 0, min: 0 },
-  // Proof of Luck Stats
-  totalLuckHits: { type: Number, default: 0, min: 0 },
-  luckHits: {
-    RARE: { type: Number, default: 0 },
-    EPIC: { type: Number, default: 0 },
-    LEGENDARY: { type: Number, default: 0 }
-  },
-
   tier: { 
     type: String, 
     enum: ['none', 'tier3', 'tier2', 'tier1'], 

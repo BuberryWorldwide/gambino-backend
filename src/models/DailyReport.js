@@ -14,14 +14,26 @@ const dailyReportSchema = new mongoose.Schema({
   storeId: { 
     type: String, 
     required: true,
-    index: true 
+    index: true,
+  },
+  
+  // Hub that sent this report
+  hubId: {
+    type: String,
+    index: true
   },
   
   // Report metadata
   printedAt: { 
     type: Date, 
     required: true,
-    index: true 
+    index: true,
+  },
+  
+  // Hub that sent this report
+  hubId: {
+    type: String,
+    index: true
   },
   reportDate: { 
     type: Date, 
@@ -105,7 +117,13 @@ const dailyReportSchema = new mongoose.Schema({
   createdAt: { 
     type: Date, 
     default: Date.now,
-    index: true 
+    index: true,
+  },
+  
+  // Hub that sent this report
+  hubId: {
+    type: String,
+    index: true
   },
   updatedAt: { 
     type: Date, 
