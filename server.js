@@ -21,7 +21,7 @@
  * 5. Remove this comment block after review
  */
 
-require('dotenv').config({ path: '/opt/gambino/.env' });
+require('dotenv').config();
 
 // Add at top of server.js
 const winston = require('winston');
@@ -35,8 +35,8 @@ const securityLogger = winston.createLogger({
     winston.format.json()
   ),
   transports: [
-    new winston.transports.File({ 
-      filename: '/opt/gambino/logs/security.log',
+    new winston.transports.File({
+      filename: './logs/security.log',
       maxsize: 10485760, // 10MB
       maxFiles: 10
     }),
@@ -113,6 +113,10 @@ const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3001;
 const createUserManagementRoutes = require('./src/routes/userManagement');
+const { sendVerificationEmail, sendWelcomeEmail } = require('./src/services/emailService');
+// Bonus disbursement services
+const BonusDisbursementService = require("./src/services/bonusDisbursementService");
+const SignupBonus = require("./src/models/SignupBonus");
 
 
 const { 
@@ -134,23 +138,13 @@ const SYSTEM_WALLETS = {
 
 // --- CORS CONFIGURATION ---
 const ALLOW = [
-  /^https:\/\/.*\.vercel\.app$/,
-  'https://app.gambino.gold',
-  'https://mine.gambino.gold',
-  'http://localhost:3000',
-  'http://localhost:3002',
-  'http://localhost:3003',
-  'http://localhost:3004',
-  'http://localhost:3005',
-  'http://localhost:8081',
-  'http://localhost:5173',
+  // Production domains only (localhost/internal IPs removed for security)
   'https://gambino.gold',
-  'http://192.168.1.235:3000',
-  'http://192.168.1.235:3002',
-  'http://192.168.1.235:3003',
-  'http://192.168.1.235:3004',  // ADD THIS
-  'https://mine.gambino.gold',
-  'https://admin.gambino.gold'
+  'https://app.gambino.gold',
+  'https://play.gambino.gold',
+  'https://admin.gambino.gold',
+  // Add specific Vercel preview URLs here if needed for staging:
+  // 'https://gambino-preview-abc123.vercel.app',
 ];
 const corsOptions = {
   origin(origin, cb) {
@@ -171,6 +165,7 @@ app.options('*', cors(corsOptions));
 
 const hubRoutes = require('./src/routes/hubs');
 app.use('/api/hubs', hubRoutes);
+app.use('/api/admin/hubs', hubRoutes); // Admin frontend expects this path
 // Token refresh routes for Pi auto-renewal
 app.use('/api/token', require('./src/routes/token-refresh'));
 
@@ -243,12 +238,13 @@ const authLimiter = rateLimit({
 });
 
 // --- RBAC SYSTEM IMPORTS (MOVED UP BEFORE USAGE) ---
-const { 
-  authenticate, 
-  requirePermission, 
+const {
+  authenticate,
+  requirePermission,
   requireVenueAccess,
   createVenueMiddleware,
-  PERMISSIONS 
+  verifyRoleFromDatabase, // SECURITY: Verify role from DB for sensitive operations
+  PERMISSIONS
 } = require('./src/middleware/rbac');
 
 // Wallet operations rate limiting
@@ -264,8 +260,9 @@ const walletLimiter = rateLimit({
 
 // Admin-specific rate limiting (general admin operations)
 const adminRateLimiter = rateLimit({
+  // Increased for admin testing
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 500,
   message: { 
     error: 'Too many admin requests from this IP',
     retryAfter: 900 
@@ -557,7 +554,7 @@ const userSchema = new mongoose.Schema({
   ipAddress: { type: String },
   role: {
     type: String,
-    enum: ['user', 'venue_staff', 'venue_manager', 'gambino_ops', 'super_admin'],
+    enum: ['user', 'venue_staff', 'venue_manager', 'operator', 'gambino_ops', 'super_admin'],
     default: 'user'
   },
   assignedVenues: {
@@ -594,6 +591,45 @@ const userSchema = new mongoose.Schema({
   balanceLastUpdated: { type: Date, default: null },
   balanceSyncAttempts: { type: Number, default: 0 },
   balanceSyncError: { type: String, default: null },
+
+  // Age Verification
+  isAgeVerified: { type: Boolean, default: false },
+  ageVerifiedAt: { type: Date },
+  ageVerifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+
+  // KYC Information
+  dateOfBirth: { type: Date },
+  kycStatus: {
+    type: String,
+    enum: ['pending', 'verified', 'rejected', 'expired'],
+    default: 'pending'
+  },
+  kycDocuments: [{
+    type: { type: String, enum: ['id', 'passport', 'license', 'utility_bill'] },
+    url: String,
+    uploadedAt: { type: Date, default: Date.now },
+    verified: { type: Boolean, default: false }
+  }],
+  kycVerifiedAt: Date,
+  kycVerifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  kycVerifiedAtVenue: { type: String },
+  kycVerificationMethod: {
+    type: String,
+    enum: ['in_person', 'document_upload'],
+    default: 'in_person'
+  },
+  kycNotes: { type: String },
+
+  // Referral System
+  referredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  referralCode: { type: String, unique: true, sparse: true },
+
+  // Email Verification
+  emailVerificationToken: { type: String },
+  emailVerificationExpires: { type: Date },
+
+  // Arca Protocol Integration
+  linkedArcaIds: [{ type: String }],
 });
 
 userSchema.methods.hasRecoverableWallet = function() {
@@ -659,6 +695,7 @@ userSchema.index({ cachedGambinoBalance: -1 });
 userSchema.index({ balanceLastUpdated: 1, walletAddress: 1 });
 userSchema.index({ role: 1, assignedVenues: 1 });
 userSchema.index({ assignedVenues: 1 });
+userSchema.index({ kycStatus: 1 });
 
 const User = mongoose.model('User', userSchema);
 
@@ -678,14 +715,14 @@ const transferSchema = new mongoose.Schema({
 const Transfer = mongoose.model('Transfer', transferSchema);
 
 
-// Transfer routes
-const transferRoutes = require('./src/routes/transfers');
-app.use('/api/wallet', transferRoutes);
+// Transfer routes (commented out - file doesn't exist)
+// const transferRoutes = require('./src/routes/transfers');
+// app.use('/api/wallet', transferRoutes);
 
 // Transaction Schema
 const transactionSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  type: { type: String, enum: ['purchase', 'jackpot', 'burn', 'tier_reward'], required: true },
+  type: { type: String, enum: ['purchase', 'jackpot', 'burn', 'tier_reward', 'cashout', 'cashout_reversal'], required: true },
   amount: { type: Number, required: true },
   usdAmount: Number,
   machineId: String,
@@ -698,6 +735,8 @@ const transactionSchema = new mongoose.Schema({
 
 transactionSchema.index({ userId: 1, createdAt: -1 });
 transactionSchema.index({ type: 1 });
+transactionSchema.index({ 'metadata.storeId': 1, createdAt: -1 }); // For cashout queries
+transactionSchema.index({ 'metadata.staffMemberId': 1, createdAt: -1 }); // For staff cashout tracking
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 //Reconciliation Service
@@ -796,6 +835,8 @@ function envTreasuryList() {
 const createAuthRoutes = require('./src/routes/auth');
 const authRoutes = createAuthRoutes(User); // Pass User model to auth routes
 app.use('/api/auth', authRoutes);
+// Games portal verification
+app.use('/api/games', require('./src/routes/games'));
 
 
 
@@ -891,7 +932,7 @@ function validatePassword(password) {
 // USER REGISTRATION
 app.post('/api/users/register', async (req, res) => {
   try {
-    const { firstName, lastName, email, phone, password } = req.body;
+    const { firstName, lastName, email, phone, password, dateOfBirth, referralCode, arcaRef } = req.body;
 
     // Input validation
     if (!firstName || !lastName) {
@@ -918,65 +959,230 @@ app.post('/api/users/register', async (req, res) => {
 
     const passwordHashed = await bcrypt.hash(password, 12);
 
+    // Generate email verification token (64 char hex)
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
     const user = await User.create({
       firstName: firstName.trim(),
       lastName: lastName.trim(),
       email: normalizedEmail,
       phone: phone?.trim(),
+      dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : null,
       password: passwordHashed,
       gambinoBalance: 0,
       gluckScore: 0,
       tier: 'none',
       role: 'user',
-      isVerified: true,
+      isVerified: false, // NOT verified until email confirmed
       isActive: true,
-      assignedVenues: []
+      assignedVenues: [],
+      emailVerificationToken: verificationToken,
+      emailVerificationExpires: verificationExpires,
+      linkedArcaIds: arcaRef ? [arcaRef] : []
     });
 
+    // Send verification email
+    try {
+      await sendVerificationEmail(user.email, user.firstName, verificationToken);
+      console.log(`📧 Verification email sent to: ${maskEmail(user.email)}`);
+    } catch (emailErr) {
+      console.error('❌ Failed to send verification email:', emailErr);
+      // Don't fail registration if email fails - user can resend
+    }
+
+    console.log(`✅ User registered (pending verification): ${maskEmail(user.email)}`);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Account created. Please check your email to verify your account.',
+      requiresVerification: true,
+      user: {
+        id: user._id,
+        email: user.email,
+        firstName: user.firstName,
+        isVerified: false
+      }
+    });
+  } catch (err) {
+    console.error('❌ /api/users/register error:', err);
+
+    // Don't expose internal errors
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'Account already exists' });
+    }
+
+    return res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// EMAIL VERIFICATION ENDPOINT
+app.post('/api/users/verify-email', async (req, res) => {
+  try {
+    const { token } = req.body;
+
+    if (!token) {
+      return res.status(400).json({ error: 'Verification token required' });
+    }
+
+    // Find user with valid token
+    const user = await User.findOne({
+      emailVerificationToken: token,
+      emailVerificationExpires: { $gt: new Date() }
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        error: 'Invalid or expired verification link. Please request a new one.'
+      });
+    }
+
+    // Already verified?
+    if (user.isVerified) {
+      return res.status(200).json({
+        success: true,
+        message: 'Email already verified. You can log in.',
+        alreadyVerified: true
+      });
+    }
+
+    // Mark as verified and clear token
+    user.isVerified = true;
+    user.emailVerificationToken = undefined;
+    user.emailVerificationExpires = undefined;
+    await user.save();
+
+    // Send welcome email (non-blocking)
+    sendWelcomeEmail(user.email, user.firstName).catch(err => {
+      console.error('Failed to send welcome email:', err);
+    });
+
+
+    // === SIGNUP BONUS DISBURSEMENT ===
+    try {
+      const bonusService = new BonusDisbursementService();
+      const bonusResult = await bonusService.disburseSignupBonus({
+        userId: user._id,
+        walletAddress: user.walletAddress,
+        email: user.email,
+        referralInfo: {
+          referrerId: user.referredBy,
+          referralCode: null
+        }
+      });
+      
+      if (bonusResult.success) {
+        console.log(`🎁 Signup bonus sent: ${bonusResult.amount} GG to ${user.email}`);
+      } else if (bonusResult.reason === 'already_distributed') {
+        console.log(`ℹ️ Signup bonus already sent to ${user.email}`);
+      } else {
+        console.warn(`⚠️ Signup bonus failed for ${user.email}: ${bonusResult.reason}`);
+      }
+    } catch (bonusErr) {
+      console.error('❌ Signup bonus error (non-critical):', bonusErr);
+      // Don't fail the verification if bonus fails
+    }
+    // Generate JWT for immediate login
     const accessToken = jwt.sign(
-      { 
-        userId: user._id, 
-        walletAddress: user.walletAddress, 
-        tier: user.tier, 
+      {
+        userId: user._id,
+        walletAddress: user.walletAddress,
+        tier: user.tier,
         email: user.email,
         role: user.role,
-        assignedVenues: user.assignedVenues,
+        assignedVenues: user.assignedVenues || [],
       },
       process.env.JWT_SECRET,
       { expiresIn: '24h', audience: 'gambino-users', issuer: 'gambino-admin' }
     );
 
-    console.log(`✅ User registered: ${maskEmail(user.email)}`);
+    console.log(`✅ Email verified for: ${maskEmail(user.email)}`);
 
-    return res.status(201).json({
+    return res.status(200).json({
       success: true,
-      message: 'Account created',
+      message: 'Email verified successfully!',
       user: {
         id: user._id,
         email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
         walletAddress: user.walletAddress,
         gambinoBalance: user.gambinoBalance,
         gluckScore: user.gluckScore,
         tier: user.tier,
         role: user.role,
-        createdAt: user.createdAt
+        isVerified: true
       },
       accessToken
     });
   } catch (err) {
-    console.error('❌ /api/users/register error:', err);
-    
-    // Don't expose internal errors
-    if (err.code === 11000) {
-      return res.status(409).json({ error: 'Account already exists' });
+    console.error('❌ /api/users/verify-email error:', err);
+    return res.status(500).json({ error: 'Verification failed. Please try again.' });
+  }
+});
+
+// RESEND VERIFICATION EMAIL
+app.post('/api/users/resend-verification', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
     }
-    
-    return res.status(500).json({ error: 'Registration failed' });
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
+
+    if (!user) {
+      // Don't reveal if email exists
+      return res.status(200).json({
+        success: true,
+        message: 'If an account exists with that email, a verification link has been sent.'
+      });
+    }
+
+    if (user.isVerified) {
+      return res.status(400).json({
+        error: 'This email is already verified. You can log in.'
+      });
+    }
+
+    // Rate limit: check if last email was sent within 2 minutes
+    if (user.emailVerificationExpires) {
+      const lastSent = new Date(user.emailVerificationExpires.getTime() - 24 * 60 * 60 * 1000);
+      const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
+      if (lastSent > twoMinutesAgo) {
+        return res.status(429).json({
+          error: 'Please wait 2 minutes before requesting another verification email.'
+        });
+      }
+    }
+
+    // Generate new token
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    user.emailVerificationToken = verificationToken;
+    user.emailVerificationExpires = verificationExpires;
+    await user.save();
+
+    // Send verification email
+    await sendVerificationEmail(user.email, user.firstName, verificationToken);
+    console.log(`📧 Verification email resent to: ${maskEmail(user.email)}`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Verification email sent. Please check your inbox.'
+    });
+  } catch (err) {
+    console.error('❌ /api/users/resend-verification error:', err);
+    return res.status(500).json({ error: 'Failed to send verification email. Please try again.' });
   }
 });
 
 // ADMIN USER MANAGEMENT ROUTES
-app.use('/api/admin/users', createUserManagementRoutes(User, Session, Transfer, Transaction));
+// SECURITY: Verify role from DB to prevent role escalation attacks
+app.use('/api/admin/users', authenticate, verifyRoleFromDatabase, createUserManagementRoutes(User, Session, Transfer, Transaction));
 
 
 
@@ -1039,7 +1245,8 @@ app.get('/api/admin/metrics', authenticate, requirePermission(PERMISSIONS.VIEW_A
 });
 
 // NEW: MACHINE METRICS ENDPOINT - Aggregated machine & store data
-app.get('/api/admin/machine-metrics', authenticate, requirePermission(PERMISSIONS.VIEW_ALL_METRICS), async (req, res) => {
+// Allow both VIEW_ALL_METRICS (admins) and VIEW_STORE_METRICS (venue managers)
+app.get('/api/admin/machine-metrics', authenticate, requirePermission([PERMISSIONS.VIEW_ALL_METRICS, PERMISSIONS.VIEW_STORE_METRICS]), async (req, res) => {
   try {
     const { storeId, timeframe = '7d' } = req.query;
     
@@ -1282,7 +1489,14 @@ app.get('/api/users/profile', authenticate, async (req, res) => {
         cachedGambinoBalance: user.cachedGambinoBalance || 0,
         cachedUsdcBalance: user.cachedUsdcBalance || 0,
         balanceLastUpdated: user.balanceLastUpdated,
-        balanceSyncError: user.balanceSyncError
+        balanceSyncError: user.balanceSyncError,
+        // KYC Status
+        kycStatus: user.kycStatus || 'pending',
+        kycVerifiedAt: user.kycVerifiedAt || null,
+        dateOfBirth: user.dateOfBirth || null,
+        referredBy: user.referredBy || null,
+        referralCode: user.referralCode || null,
+        linkedArcaIds: user.linkedArcaIds || []
       }
     });
   } catch (error) {
@@ -1437,7 +1651,7 @@ app.post('/api/users/end-session', authenticate, async (req, res) => {
 // USER PROFILE UPDATE ROUTES
 app.put('/api/users/profile', authenticate, async (req, res) => {
   try {
-    const { firstName, lastName, phone, email } = req.body;
+    const { firstName, lastName, phone, email, dateOfBirth } = req.body;
     const userId = req.user.userId;
 
     if (firstName && firstName.trim().length === 0) {
@@ -1461,6 +1675,8 @@ app.put('/api/users/profile', authenticate, async (req, res) => {
     if (firstName !== undefined) user.firstName = firstName.trim();
     if (lastName !== undefined) user.lastName = lastName.trim();
     if (phone !== undefined) user.phone = phone;
+    if (dateOfBirth !== undefined) user.dateOfBirth = dateOfBirth ? new Date(dateOfBirth) : null;
+    if (req.body.clearLinkedArcaIds) user.linkedArcaIds = [];
     
     user.lastActivity = new Date();
     await user.save();
@@ -1668,6 +1884,73 @@ app.get('/api/wallet/private-key', authenticate, async (req, res) => {
   }
 });
 
+// Attach client-created wallet (no signature required - user created it locally)
+app.post("/api/wallet/attach", authenticate, async (req, res) => {
+  try {
+    const { publicKey } = req.body || {};
+
+    if (!publicKey || typeof publicKey !== "string" || publicKey.length < 32) {
+      return res.status(400).json({ error: "Valid public key required" });
+    }
+
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    if (user.walletAddress) {
+      return res.status(409).json({ error: "Wallet already set for this account" });
+    }
+
+    const taken = await User.findOne({ walletAddress: publicKey });
+    if (taken) return res.status(409).json({ error: "That wallet is already linked to another account" });
+
+    user.walletAddress = publicKey;
+    user.privateKey = null;
+    user.privateKeyIV = null;
+    user.walletCreatedAt = new Date();
+    user.walletType = "connected";
+    user.lastActivity = new Date();
+    await user.save();
+
+    console.log(`✅ Client wallet attached for ${user.email}: ${publicKey.slice(0, 8)}...`);
+
+    // Return immediately - don't block on bonus disbursement
+    res.json({ success: true, walletAddress: publicKey });
+
+    // === TRIGGER SIGNUP BONUS IN BACKGROUND (fire-and-forget) ===
+    if (user.isVerified) {
+      setImmediate(async () => {
+        try {
+          const bonusService = new BonusDisbursementService();
+          const bonusResult = await bonusService.disburseSignupBonus({
+            userId: user._id,
+            walletAddress: publicKey,
+            email: user.email,
+            referralInfo: {
+              referrerId: user.referredBy,
+              referralCode: null
+            }
+          });
+
+          if (bonusResult.success) {
+            console.log(`🎁 Signup bonus sent on wallet attach: ${bonusResult.amount} GG to ${user.email}`);
+          } else if (bonusResult.reason === 'already_distributed') {
+            console.log(`ℹ️ Signup bonus already sent to ${user.email}`);
+          } else if (bonusResult.reason !== 'no_wallet') {
+            console.warn(`⚠️ Signup bonus failed for ${user.email}: ${bonusResult.reason}`);
+          }
+        } catch (bonusErr) {
+          console.error('❌ Signup bonus error on wallet attach (non-critical):', bonusErr);
+        }
+      });
+    }
+
+    return; // Response already sent
+  } catch (e) {
+    console.error("❌ /api/wallet/attach error:", e);
+    return res.status(500).json({ error: "Failed to attach wallet" });
+  }
+});
+
 app.post('/api/wallet/connect', authenticate, async (req, res) => {
   try {
     const { publicKey, message, signatureBase64 } = req.body || {};
@@ -1693,7 +1976,38 @@ app.post('/api/wallet/connect', authenticate, async (req, res) => {
 
     console.log(`🔗 External wallet connected for ${user.email}: ${publicKey.slice(0, 8)}...`);
 
-    return res.json({ success: true, walletAddress: publicKey });
+    // Return immediately - don't block on bonus disbursement
+    res.json({ success: true, walletAddress: publicKey });
+
+    // === TRIGGER SIGNUP BONUS IN BACKGROUND (fire-and-forget) ===
+    if (user.isVerified) {
+      setImmediate(async () => {
+        try {
+          const bonusService = new BonusDisbursementService();
+          const bonusResult = await bonusService.disburseSignupBonus({
+            userId: user._id,
+            walletAddress: publicKey,
+            email: user.email,
+            referralInfo: {
+              referrerId: user.referredBy,
+              referralCode: null
+            }
+          });
+
+          if (bonusResult.success) {
+            console.log(`🎁 Signup bonus sent on wallet connect: ${bonusResult.amount} GG to ${user.email}`);
+          } else if (bonusResult.reason === 'already_distributed') {
+            console.log(`ℹ️ Signup bonus already sent to ${user.email}`);
+          } else if (bonusResult.reason !== 'no_wallet') {
+            console.warn(`⚠️ Signup bonus failed for ${user.email}: ${bonusResult.reason}`);
+          }
+        } catch (bonusErr) {
+          console.error('❌ Signup bonus error on wallet connect (non-critical):', bonusErr);
+        }
+      });
+    }
+
+    return; // Response already sent
   } catch (e) {
     console.error('❌ /api/wallet/connect error:', e);
     return res.status(500).json({ error: 'Failed to link wallet' });
@@ -1701,7 +2015,7 @@ app.post('/api/wallet/connect', authenticate, async (req, res) => {
 });
 
 // ADMIN STORE MANAGEMENT
-app.get('/api/admin/stores', authenticate, requirePermission(PERMISSIONS.MANAGE_ASSIGNED_STORES), async (req, res) => {
+app.get('/api/admin/stores', authenticate, requirePermission([PERMISSIONS.MANAGE_ALL_STORES, PERMISSIONS.MANAGE_ASSIGNED_STORES]), async (req, res) => {
   try {
     const { q } = req.query;
     const userRole = req.user.role;
@@ -1790,7 +2104,7 @@ app.put('/api/admin/stores/:storeId', ...createVenueMiddleware({ requireManageme
   }
 });
 
-app.post('/api/admin/stores/create', authenticate, requirePermission(PERMISSIONS.MANAGE_ASSIGNED_STORES), async (req, res) => {
+app.post('/api/admin/stores/create', authenticate, requirePermission([PERMISSIONS.MANAGE_ALL_STORES, PERMISSIONS.MANAGE_ASSIGNED_STORES]), async (req, res) => {
   try {
     const role = req.user.role;
     const { 
@@ -1955,13 +2269,16 @@ app.use('/api/machines', require('./src/routes/machines'));
 app.use('/api/admin/machines', require('./src/routes/routes-machine-details'));
 
 // HUB MANAGEMENT (remove duplicate)
-app.use('/api/admin/hubs', require('./src/routes/hubs'));
+// REMOVED: Duplicate hubs mount (cleanup script)
 
 // EDGE DEVICE OPERATIONS
 app.use('/api/edge', require('./src/routes/edge'));
 
 // TREASURY MANAGEMENT
-app.use('/api/admin/treasury', authenticate, requirePermission(PERMISSIONS.VIEW_ALL_METRICS), require('./src/routes/blockchainTreasuryRoutes'));
+// SECURITY: Verify role from DB to prevent unauthorized treasury access
+app.use('/api/admin/treasury', authenticate, verifyRoleFromDatabase, requirePermission(PERMISSIONS.VIEW_ALL_METRICS), require('./src/routes/blockchainTreasuryRoutes'));
+// Distribution Dashboard - simple routes for viewing treasury balances
+app.use('/api/distribution', authenticate, verifyRoleFromDatabase, requirePermission(PERMISSIONS.SYSTEM_ADMIN), require('./src/routes/distributionRoutes'));
 
 // CASHOUT MANAGEMENT
 app.use('/api/cashout', require('./src/routes/cashout'));
@@ -1969,227 +2286,157 @@ app.use('/api/cashout', require('./src/routes/cashout'));
 // ANALYTICS ROUTES
 app.use('/api', require('./src/routes/analytics'));
 
+// KYC VERIFICATION ROUTES
+// Allows venue staff to KYC verify users and triggers referral verification
+const createKycRoutes = require('./src/routes/kyc');
+app.use('/api/kyc', createKycRoutes(User));
 
+// REMOVED: Inline leaderboard route (manual cleanup)
+// Moved to entropy-game-backend
 
-
-// BASIC LEADERBOARD (SIMPLIFIED)
-app.get('/api/leaderboard', async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '50', 10), 100);
-
-    const topUsers = await User.find({ 
-      isActive: { $ne: false },
-      gambinoBalance: { $gt: 0 }
-    })
-    .sort({ gambinoBalance: -1 })
-    .limit(limit)
-    .select('firstName lastName email walletAddress role isActive createdAt assignedVenues')
-    .lean();
-
-    const leaderboard = topUsers.map((user, index) => ({
-      rank: index + 1,
-      name: `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Anonymous Player',
-      email: user.email ? user.email.replace(/(.{2})(.*)(@.*)/, '$1***$3') : 'N/A',
-      balance: user.gambinoBalance || 0,
-      totalJackpots: user.totalJackpots || 0,
-      majorJackpots: user.majorJackpots || 0,
-      minorJackpots: user.minorJackpots || 0,
-      memberSince: user.createdAt
-    }));
-
-    const totalCirculating = leaderboard.reduce((sum, user) => sum + user.balance, 0);
-    
-    res.json({
-      success: true,
-      leaderboard,
-      stats: {
-        totalPlayers: leaderboard.length,
-        totalCirculating,
-        lastUpdated: new Date(),
-        dataSource: 'database'
-      }
-    });
-  } catch (error) {
-    console.error('Leaderboard error:', error);
-    res.status(500).json({ error: 'Failed to load leaderboard' });
-  }
-});
-
-console.log('📱 Loading mobile mining routes...');
-
-// Your existing MiningSession model (already created)
-const MiningSession = require('./src/models/MiningSession');
-
-// Import mobile-specific models (you'll need to create these)
-const EscrowBalance = require('./src/models/EscrowBalance');
-const MobileCredit = require('./src/models/MobileCredit');
-
-// Import mobile mining routes
-const { router: miningRouterBase, setupMiningRoutes } = require('./src/routes/mining');
-const { router: mobileRouterBase, setupMobileRoutes } = require('./src/routes/mobile');
-
-// Setup routes with dependencies and CAPTURE the returned router
-const miningRouter = setupMiningRoutes({
-  MiningSession,
-  EscrowBalance,
-  authenticate
-});
-
-const mobileRouter = setupMobileRoutes({
-  EscrowBalance,
-  MobileCredit,
-  authenticate
-});
-
-
-
-// Mount routes
-app.use('/api/mining', miningRouter);
-app.use('/api/mobile', mobileRouter);
-
-console.log('✅ Mobile mining routes mounted:');
-console.log('   📱 Mining Endpoints:');
-console.log('      POST   /api/mining/start-session');
-console.log('      POST   /api/mining/submit-entropy');
-console.log('      POST   /api/mining/end-session');
-console.log('      GET    /api/mining/active-session');
-console.log('      GET    /api/mining/stats');
-console.log('      GET    /api/mining/history');
-console.log('   💰 Mobile Endpoints:');
-console.log('      GET    /api/mobile/escrow/balance');
-console.log('      GET    /api/mobile/credits/balance');
-console.log('      POST   /api/mobile/credits/purchase');
-console.log('      POST   /api/mobile/credits/use');
-console.log('      POST   /api/mobile/escrow/withdraw');
-console.log('      GET    /api/mobile/account/summary');
-
-// ============================================
-// END MOBILE MINING INTEGRATION
+// REMOVED: Mobile mining integration (cleanup script)
 // ============================================
 
 // ===== ENTROPY ROUTES =====
-console.log('🎲 Loading entropy routes...');
-const { router: entropyRouter, setupEntropyRoutes } = require('./src/routes/entropy');
+// REMOVED: Entropy routes (cleanup script)
 
-// Setup entropy routes with dependencies
-setupEntropyRoutes({
-  authenticate,        // Already defined above (from RBAC)
-  redisClient,         // Already defined above
-  User,               // Already defined above
-  EntropySession: require('./src/models/EntropySession')
-});
-
-app.use('/api/entropy', entropyRouter);
-console.log('✅ Entropy routes mounted:');
-console.log('   🎲 POST   /api/entropy/work/start');
-console.log('   🎲 POST   /api/entropy/work/reveal');
-console.log('   🎲 GET    /api/entropy/stats');
-
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('❌ Server error:', error);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// User venue assignment migration
-const migrateExistingUsers = async () => {
+// ============================================
+// REFERRAL VALIDATION ENDPOINT (Public)
+// ============================================
+app.post('/api/referral/validate', async (req, res) => {
   try {
-    console.log('🔄 Starting user venue assignment migration...');
-    
-    const result = await User.updateMany(
-      { assignedVenues: { $exists: false } },
-      { $set: { assignedVenues: [] } }
-    );
-    
-    console.log(`✅ Migration complete: ${result.modifiedCount} users updated with empty assignedVenues`);
-    return true;
-  } catch (error) {
-    console.error('❌ User migration failed:', error);
-    return false;
-  }
-};
+    const { code } = req.body;
 
-// ONE-TIME MIGRATION: Backfill wallet creation dates for existing wallets
-const backfillWalletDates = async () => {
-  try {
-    console.log('🔄 Starting wallet date backfill migration...');
-    
-    // Find all users with wallets but no walletCreatedAt
-    const usersNeedingBackfill = await User.find({
-      walletAddress: { $exists: true, $ne: null },
-      walletCreatedAt: { $exists: false }
-    });
+    if (!code || code.length < 6) {
+      return res.json({
+        valid: false,
+        error: 'Invalid referral code format'
+      });
+    }
 
-    console.log(`📊 Found ${usersNeedingBackfill.length} wallets to backfill`);
+    // Look up user with this referral code
+    const referrer = await User.findOne({
+      referralCode: code.toUpperCase()
+    }).select('firstName lastName kycStatus');
 
-    for (const user of usersNeedingBackfill) {
-      // Set wallet creation date to account creation date (best guess)
-      user.walletCreatedAt = user.createdAt;
-      
-      // Try to determine wallet type based on privateKey presence
-      if (user.privateKey && user.privateKeyIV) {
-        user.walletType = 'generated';
-      } else {
-        user.walletType = 'connected';
+    if (!referrer) {
+      return res.json({
+        valid: false,
+        error: 'Referral code not found'
+      });
+    }
+
+    // Only allow referral codes from KYC-verified users
+    if (referrer.kycStatus !== 'verified') {
+      return res.json({
+        valid: false,
+        error: 'Referrer has not completed verification'
+      });
+    }
+
+    // Return success with referrer info (first name only for privacy)
+    return res.json({
+      valid: true,
+      referrer: {
+        firstName: referrer.firstName,
+        // Show first initial of last name
+        lastInitial: referrer.lastName ? referrer.lastName.charAt(0) + '.' : ''
+      },
+      rewards: {
+        newUser: 25, // GG tokens for new user after KYC
+        referrer: 25  // GG tokens for referrer after new user KYC
       }
-      
-      await user.save();
-    }
-
-    console.log(`✅ Backfilled ${usersNeedingBackfill.length} wallet records`);
-    return true;
-  } catch (error) {
-    console.error('❌ Wallet backfill migration failed:', error);
-    return false;
-  }
-};
-
-
-
-
-// ENHANCED SERVER STARTUP
-const startServer = async () => {
-  try {
-    // 1. Connect to MongoDB
-    await connectDB();
-    
-    // 2. Run user venue assignment migration
-    await migrateExistingUsers();
-
-    // 3. Backfill wallet dates (ADD THIS LINE) 👇
-    await backfillWalletDates();
-    
-    // 4. Run session database repair
-    console.log('🔧 Repairing session database...');
-    const repairSuccess = await repairSessionDatabase();
-    
-    if (!repairSuccess) {
-      console.log('⚠️ Session repair had issues, but continuing startup...');
-    }
-    
-    // 4. Connect to Redis
-    await connectRedis();
-    
-    // 5. Clean up old sessions
-    await cleanupOldSessions();
-    
-    // 6. Start the server
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🎰 Gambino Backend running on port ${PORT}`);
-      console.log(`🔗 Health: http://localhost:${PORT}/health`);
-      console.log(`✅ Session database verified and ready`);
     });
-    
-  } catch (e) {
-    console.error('❌ Failed to start server:', e);
-    process.exit(1);
-  }
-};
 
-// Start the server
-startServer();
+  } catch (error) {
+    console.error('Referral validation error:', error);
+    return res.status(500).json({
+      valid: false,
+      error: 'Failed to validate referral code'
+    });
+  }
+});
+
+// Get referral statistics for current user
+app.get('/api/referral/stats', authenticate, async (req, res) => {
+  try {
+    const Referral = require('./src/models/Referral');
+    const stats = await Referral.getUserStats(req.user.userId);
+
+    return res.json({
+      totalReferrals: stats.totalReferrals || 0,
+      pendingReferrals: stats.pendingReferrals || 0,
+      verifiedReferrals: (stats.verifiedReferrals || 0) + (stats.distributedReferrals || 0),
+      totalRewards: stats.totalRewards || 0,
+      monthlyReferrals: stats.monthlyReferrals || 0
+    });
+  } catch (error) {
+    console.error('Referral stats error:', error);
+    return res.status(500).json({ error: 'Failed to get referral stats' });
+  }
+});
+
+// Get referral history for current user
+app.get('/api/referral/history', authenticate, async (req, res) => {
+  try {
+    const Referral = require('./src/models/Referral');
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const skip = (page - 1) * limit;
+
+    const referrals = await Referral.find({ referrerId: req.user.userId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('newUserId', 'firstName lastName email createdAt')
+      .lean();
+
+    const total = await Referral.countDocuments({ referrerId: req.user.userId });
+
+    const formattedReferrals = referrals.map(ref => ({
+      id: ref._id,
+      newUserName: ref.newUserId?.firstName
+        ? `${ref.newUserId.firstName} ${ref.newUserId.lastName?.charAt(0) || ''}.`
+        : 'Anonymous',
+      status: ref.status,
+      rewardAmount: ref.amounts?.referrer || 0,
+      createdAt: ref.createdAt,
+      distributedAt: ref.distributedAt,
+      firstSessionAt: ref.firstSessionAt
+    }));
+
+    return res.json({
+      referrals: formattedReferrals,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Referral history error:', error);
+    return res.status(500).json({ error: 'Failed to get referral history' });
+  }
+});
+
+// ============================================
+// MongoDB Connection & Server Startup
+// ============================================
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => {
+  console.log('✅ MongoDB connected successfully');
+
+  // Start server only after DB connection
+  app.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  });
+})
+.catch((err) => {
+  console.error('❌ MongoDB connection error:', err);
+  process.exit(1);
+});
